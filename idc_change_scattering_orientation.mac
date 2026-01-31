@@ -1,0 +1,123 @@
+def go_vert '{
+# Move to Vertical Scattering GEO
+# First move save starting location
+get_angles
+
+_do_it_anyway = 0
+    if($# == 1){
+	_do_it_anyway = $1
+   }
+
+if (A[2]> 45) {      
+	  if(_do_it_anyway==0) {
+		  eprint ""
+		  eprint "Already in vertical"
+		  _1 = getval(" To move anyway enter 1", 0)
+		  eprint ""
+		  if (_1 == 0) return(0)
+		}
+}
+limits_ctr
+mvr phi .1
+wh
+or_del = 70
+or_eta = 0
+or_chi = 0
+or_phi = 0
+or_nu = 0
+or_mu = 0
+A[0] = or_del
+A[1] = or_eta
+A[2] = or_chi
+A[3] = or_phi
+A[4] = or_nu
+A[5] = or_mu
+move_all
+waitmove
+sleep(5)
+
+# Now move to vertical scattering
+limits_load
+mvr phi .1
+wh
+or_del = 70
+or_eta = 0
+or_chi = 90
+or_phi = 0
+or_nu = 0
+or_mu = 0
+A[0] = or_del
+A[1] = or_eta
+A[2] = or_chi
+A[3] = or_phi
+A[4] = or_nu
+A[5] = or_mu
+move_all
+waitmove
+sleep(5)
+limits_vert
+
+wh
+}'
+
+def go_horz '{
+# Move to Hor Scattering GEO
+# First move save starting location
+get_angles
+
+_do_it_anyway = 0
+    if($# == 1){
+	_do_it_anyway = $1
+   }
+
+
+if (A[2]< 45) {
+      if(_do_it_anyway==0) {
+	  	  eprint ""
+		  eprint "Already in Horizontal"
+		  _1 = getval(" To move anyway enter 1", 0)
+		  eprint ""
+		  if (_1 == 0) return(0)
+	  }
+}
+limits_vert
+mvr phi .1
+wh
+or_del = 70
+or_eta = 0
+or_chi = 90
+or_phi = 0
+or_nu = 0
+or_mu = 0
+A[0] = or_del
+A[1] = or_eta
+A[2] = or_chi
+A[3] = or_phi
+A[4] = or_nu
+A[5] = or_mu
+move_all
+waitmove
+sleep(5)
+
+# Now move to horizontal scattering
+limits_load
+mvr phi .1
+wh
+or_del = 70
+or_eta = 0
+or_chi = 0
+or_phi = 0
+or_nu = 0
+or_mu = 0
+A[0] = or_del
+A[1] = or_eta
+A[2] = or_chi
+A[3] = or_phi
+A[4] = or_nu
+A[5] = or_mu
+move_all
+waitmove
+sleep(5)
+wh
+limits_ctr
+}'

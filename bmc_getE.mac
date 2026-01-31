@@ -1,0 +1,9 @@
+def getE '{
+
+  local _E_ev
+
+  _E_ev = epics_get("13BMC:E_DummyRBV")
+  
+  LAMBDA =  hc_over_e/(_E_ev/1.)
+
+}'

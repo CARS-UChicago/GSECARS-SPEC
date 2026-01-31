@@ -1,0 +1,106 @@
+def limits_xsw '{
+  ############ Set Limits for XSW ##############
+  
+  set_lm kphi -180.1 180.1
+  set_lm kap -5.1 5.1
+  set_lm keta -50.1 80.1
+  set_lm mu -4.1 4.1
+  set_lm del -2.391 70.1
+  set_lm nu -4.1 4.1
+  
+#############################################
+}'
+
+def limits_ctr '{
+  ############ Set Limits for CTR ##############
+ 
+ set_lm kphi -180.1 180.1
+  set_lm kap -15.1 16.7
+  set_lm keta -50.1 80.1
+  #set_lm mu -4.1 30.1
+  set_lm mu -2.1 30.1
+  set_lm del -2.391 70.1
+  set_lm nu -10.1 56.0
+  #set_lm nu -10.1 10.1
+
+  #############################################
+}'
+
+def limits_laser '{
+  ############ Set Limits for Laser ##############
+  
+  set_lm kphi -180.1 180.1
+  set_lm kap -15.1 16.7
+  set_lm keta -50.1 180.1
+  set_lm mu -4.1 30.1
+  set_lm del -2.391 70.1
+  set_lm nu -10.1 45.1
+  #set_lm nu -10.1 10.1
+
+  #############################################
+}'
+
+def limits_load '{
+  ########Limits for Loading at chi=90 #########
+  
+  set_lm kphi -180.1 180.1
+  set_lm kap -15.1 136.1
+  set_lm keta -12.1 60.1
+  set_lm mu -10.1 11.1
+  set_lm del -2.391 70.1
+  set_lm nu -10.1 45.1
+  #set_lm nu -10.1 10.1
+
+  #############################################
+}'
+
+def limits_vert '{
+  ######## Set Limits for Vertical CTR #########
+  
+  set_lm kphi -180.1 180.1
+  set_lm kap 113.9 165.1
+  set_lm keta 35.9 96.1
+  set_lm mu -10.1 27.1
+  set_lm del -1.1 90.1
+  set_lm nu -15.1 55.1
+  #set_lm nu -10.1 10.1
+  #############################################
+}'
+
+def limits_cleanup_slit_vert '{
+  ######## Set Limits for Vert scatter with cleanup pinhole mounted on mu table #########
+  
+  set_lm kphi -180.1 180.1
+  set_lm kap   115.5 138.7
+  set_lm keta   53.1  90.1
+  set_lm mu     -0.1   0.1
+  set_lm del    -2.4  70.1
+  set_lm nu     -1.1   1.1
+  #############################################
+}'
+
+def limits_polefigure '{
+  ######## Set Limits for Horz. Pole Figures  ###
+  
+  set_lm kphi -210.1 210.1
+  set_lm kap -1.1 135.1
+  set_lm keta -1.1 57.1
+  set_lm mu -1.1 30.1
+  set_lm del -3.1 70.1
+  set_lm nu -1.1 60.1 
+
+  #############################################
+  }'
+  
+  def limits_initialize '{
+  ######## Set Limits for homing diffractometer rotations  ###
+  
+ set_lm kphi -180.1 180.1
+  set_lm kap -10.1 165.1
+  set_lm keta -10.1 110.1
+  set_lm mu -10.1 27.1
+  set_lm del -3.1 95.1
+  set_lm nu -15.1 55.1 
+
+  #############################################
+  }'

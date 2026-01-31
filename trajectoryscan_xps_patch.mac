@@ -1,0 +1,3036 @@
+"""
+Macro definitions for trajectory scanning (continuous scans through
+synchronized multi-motor trajectories).
+
+Description
+===========
+
+This is a collection of SPEC macros to interface with the EPICS support for
+complex trajectory scanning (otherwise also known as "fly scanning" or
+"slew scanning") using the Newport XPS motion controllers. It takes care of
+building the trajectory path (for example, the complex angular motion profile
+of several diffractometer circles necessary to navigate along a straight line
+in reciprocal space at constant speed), preparing the instrument for the scan
+(e.g.: make sure the photon shutter is opened ahead of time), plotting the scan
+data as it is made available by the EPICS layer during the scan, collecting the
+data from various detectors and the motion controller support at the end of the
+scan, and writing the scan data transparently into the SPEC file, using the
+standard data format (making it almost indistinguishable from a standard SPEC
+scan).
+
+Note(s)n
+=======
+
+#.  This macro is based on:
+
+      - traj_scans.mac from GSECARS, Sector 13, Mark Rivers, August 20, 2000
+
+#.  More information about the EPICS support for XPS trajectory scanning and
+    very useful notes on hardware setup and performance can be found here:
+
+      http://cars9.uchicago.edu/software/epics/trajectoryScan.html
+
+    Note that the section on the SPEC interface in the above document was
+    written for the original implementation of SPEC macros, which are now
+    deprecated in favor of using this version of the macros.
+
+#.  Presently, the macro is written to support Newport XPS controllers through
+    their trajectory scan EPICS support. Similar EPICS support is available for
+    a number of different motor controllers now (DeltaTau, MaxV, ...). It
+    should be fairly straightforward to adapt this macro to work with more than
+    one type of controller, possible by extending the setup dialogue to account
+    for special requirements for each of the controller models.
+
+#.  Since trajectory scans are performed outside of SPEC through EPICS, the way
+    that SPEC acquires the scan data differs fundamentally from a "normal" SPEC
+    scan: For trajectory scans, all header macros are executed normally, then
+    the execution of the scan is handed off to EPICS. After the successful
+    completion (or abortion) of the scan, SPEC retrieves the scan information
+    back from EPICS by, for example, collecting all of the monitor counts from
+    the MCA records or the motor positions from the XPS trajectoryscan records.
+    This information is then written to the SPEC data file and the usual scan
+    tail macros are called.
+    This scheme requires major changes to the scan macros. This problem is
+    solved by providing separate scan definitions for trajectory scans, which
+    overwrite and therefore replace the standard scan definitions when
+    trajectory scanning is enabled. Upon disabling trajectory scanning again,
+    the standard definitions are restored, which is achieved by overwriting the
+    modified definitions with the originals again.
+    Additionally, the standard scan count command is also disabled to avoid
+    SPEC issuing count commands while collecting the results from EPICS and
+    writing them into the scan file using the standard :spec:def:`scan_loop`
+    command.
+
+
+Limitations
+===========
+
+#.  Since SPEC is essentially running the scans blindly (apart for the periodic
+    collection of data for plotting purposes) and handing off the entire
+    execution to the EPICS layer, none of the usual feedback mechanisms are
+    availalbe during the scan. This includes, for example, the possibility to
+    automatically adjust attenuator transmission and exposure times during
+    scans, pausing a scan in case the beam has dumped, etc.
+    Also, any counter or positioner information which is not simultaneously
+    collected during the scan through the MCA record or some other similar
+    means will be filled in after the scan has finished, and is therefore
+    asynchronous. For example, the temperature readout for some heater stage
+    would be queried for each scan point at the end of the scan, effectively
+    being blind to the real temperature change that occurred during the scan.
+
+#.  Due to the way that SPEC commands and macros are parsed, it is not possible
+    to enable/disable trajectory scanning outside of the global namespace. The
+    results of calling :spec:def:`trajectoryscan_on`` or
+    :spec:def:`trajectoryscan_off` within nested structures are likely to cause
+    unexpected behaviour. This is due to the way the :spec:def:`clone` command
+    works. The details of the inner workings of the parser are complex, and the
+    interested reader is referred to the corresponding SPEC manual section.
+    As a rule of thumb, make sure that any calls to enable/disable trajectory
+    scanning are NOT enclosed by sets of curly brackets ``{ }`` (whith respect
+    to the SPEC command line level). Be careful when including calls to
+    :spec:def:`trajectoryscan_on`` or :spec:def:`trajectoryscan_off` inside
+    other definitions, even if not enclosed in curly brackets, since these new
+    definitions might be used by unaware users deeper inside their own
+    definitions that could contain enclosing brackets.
+
+
+Flow diagram
+============
+
+The below diagrams visualize the sequence of macro calls issued during a
+trajectory scan or during setup. Any macro call marked with a ``*`` is a
+placeholder for userdefined macro calls to be inserted via chained macro
+definitions (``cdef``), and is empty by default. These macro hooks can be used,
+for example, to add all of the definitions necessary to arm, trigger, and read
+out an additional detector. Any command not containing the word
+``trajectoryscan`` is a standard built-in command.
+
+#. Adding/removing trajectoryscan definitions to standard SPEC macro hooks::
+
+    |-- trajectoryscan_add
+    |   |-- _trajectoryscan_user_add*
+
+    |-- trajectoryscan_remove
+    |   |-- _trajectoryscan_user_remove*
+
+
+#. Running a trajectory scan (e.g.: ascan)::
+
+    |-- _trajectoryscan_ascan
+    |   |-- _trajectoryscan_pre_check
+    |   |-- scan_head
+    |   |-- _trajectoryscan_init
+    |   |   |-- _trajectoryscan_mcs_init
+    |   |   |-- _trajectoryscan_user_init*
+    |   |-- _trajectoryscan_arm
+    |   |   |-- _trajectoryscan_mcs_arm
+    |   |   |-- _trajectoryscan_user_arm*
+    |   |-- _trajectoryscan_build
+    |   |-- _trajectoryscan_run
+    |   |   |-- _trajectoryscan_user_pre_run*
+    |   |   |-- _trajectoryscan_get_data
+    |   |   |   |-- _trajectoryscan_get_current_point()
+    |   |   |   |-- _trajectoryscan_mcs_get_data
+    |   |   |   |-- _trajectoryscan_user_get_data*
+    |   |   |   |-- _trajectoryscan_mcs_read_counts
+    |   |   |   |-- _trajectoryscan_user_read_counts*
+    |   |   |   |-- _trajectoryscan_read_positions
+    |   |   |-- _trajectoryscan_plot
+    |   |   |-- _trajectoryscan_mcs_stop
+    |   |   |-- _trajectoryscan_mcs_wait
+    |   |   |-- _trajectoryscan_user_wait*
+    |   |   |-- _trajectoryscan_user_post_run*
+    |   |-- _trajectoryscan_savedata_func() --> _trajectoryscan_savedata_ascan
+    |   |   |-- get_angles
+    |   |   |-- measure0
+    |   |   |-- get_counts
+    |   |   |-- measure1
+    |   |   |-- measure2
+    |   |   |-- [FOR ALL POINTS]:
+    |   |   |   |-- _trajectoryscan_user_savedata*
+    |   |   |   |-- scan_loop
+    |   |   |-- scan_tail
+    |   |-- _trajectoryscan_finish
+    |       |-- _trajectoryscan_user_finish*
+    |
+
+#. Aborting a trajectory scan::
+
+    |-- _trajectoryscan_abort
+    |   |-- _trajectoryscan_user_pre_abort*
+    |   |-- _trajectoryscan_mcs_stop
+    |   |-- waitmove
+    |   |-- _trajectoryscan_mcs_wait
+    |   |-- _trajectoryscan_user_wait*
+    |   |-- _trajectoryscan_get_data
+    |   |   |-- _trajectoryscan_get_current_point()
+    |   |   |-- _trajectoryscan_mcs_get_data
+    |   |   |-- _trajectoryscan_user_get_data*
+    |   |   |-- _trajectoryscan_mcs_read_counts
+    |   |   |-- _trajectoryscan_user_read_counts*
+    |   |   |-- _trajectoryscan_read_positions
+    |   |-- _trajectoryscan_savedata_func() --> _trajectoryscan_savedata_ascan
+    |   |   |-- get_angles
+    |   |   |-- measure0
+    |   |   |-- get_counts
+    |   |   |-- measure1
+    |   |   |-- measure2
+    |   |   |-- [FOR ALL POINTS]:
+    |   |   |   |-- _trajectoryscan_user_savedata*
+    |   |   |   |-- scan_loop
+    |   |   |-- scan_tail
+    |   |-- _trajectoryscan_plot
+    |   |-- _trajectoryscan_finish
+    |   |   |-- _trajectoryscan_user_finish*
+    |   |-- _trajectoryscan_user_post_abort*
+
+
+Installation
+============
+
+Hardware
+--------
+The minimum requirement in terms of hardware is the following:
+
+  - Newport XPS controller with one or more motors grouped together in a group.
+  - Multi-channel scaler with MCS support in EPICS (e.g.: Struck 3820)
+  - Trigger signal wiring between the XPS and MCA
+  - Optional: additional triggerable detectors (need separate macros for
+    control, see section on flow diagram below)
+
+See the EPICS support documentation for more info:
+
+  http://cars9.uchicago.edu/software/epics/trajectoryScan.html
+
+In the following, it is assumed that the EPICS support is fully functional.
+
+Setup
+-----
+
+Make sure that all dependencies are resolved, the follow these steps to setup
+up the functionality:
+
+First, load the macro file::
+
+  > qdo trajectoryscan_xps.mac
+
+Then, it is necessary to ass some macro hooks into the right places (only needs
+to be done once after starting SPEC fresh)::
+
+  > trajectoryscan_add
+
+Next, adapt the trajectoryscan settings for your needs::
+
+  > trajectoryscan_setup
+
+Finally, enable and disable trajectoryscanning using the following commands::
+
+  > trajectoryscan_on
+  > trajectoryscan_off
+
+
+Dependencies
+------------
+This macro depends on the following macro files and macros:
+
+- shutter.mac
+    Beam shutter macro. If no beam shutter is present and ``shutter.mac`` does
+    not exist, trajectory scans will still work normally.
+
+
+Impact
+------
+When switching between normal point scans and trajectory scans, the underlying
+scan macro definitions need to be redefined. The following macro definitions
+are redefined by ``trajectoryscans.mac``:
+
+- :spec:def:`_ascan`
+- :spec:def:`mesh`
+- :spec:def:`hklscan`
+- :spec:def:`_hklmesh`
+- :spec:def:`_hklline`
+- :spec:def:`_scanabort`
+- :spec:def:`resume`
+- :spec:def:`_count`
+
+
+File information
+================
+
+AUTHORS:
+
+  * Mark L. Rivers (MLR)
+    GSECARS, University of Chicago, rivers@cars.uchicago.edu
+  * Peter J. Eng (PJE)
+    GSECARS, University of Chicago, eng@cars.uchicago.edu
+  * Tom Trainor (T2)
+  * Sanjit Ghose (SKG)
+  * Christian M. Schlepuetz (CS, cschlep),
+    Argonne National Laboratory, cschlep@aps.anl.gov
+  * Jeffrey A. Kirchman (JAK, jkirchman),
+    Argonne National Laboratory, jkirchman@aps.anl.gov
+
+CREATION DATE:
+
+  2010/07/19
+
+COPYRIGHT:
+
+  .. automatically retrieve the current year:
+  .. |current_year| date:: %Y
+
+  Copyright (c) 2010-|current_year| by the above authors (see AUTHOR/AUTHORS)
+
+LICENSE:
+
+  TBD
+
+VERSION::
+
+  $Revision: 1358 $
+  $Date: 2017-01-06 15:36:29 -0600 (Fri, 06 Jan 2017) $
+  $Author: stubbs $
+  $URL: https://subversion.xray.aps.anl.gov/spec/common/aps/trajectoryscan_xps.mac $
+
+CHANGE LOG:
+
+  2012-07-25 (CS):
+
+  - General overhaul of the entire macro.
+  - Changed name from ``trajectory.mac`` to ``trajectoryscan.mac``
+  - Changed naming of all global variables and macro definitions to reflect
+    name change to ``trajectoryscan``.
+  - Using the built-in spec command :spec:def:`clone()` to store original macro
+    definitions for step scans and to restore them when disabling trajectory
+    scanning.
+  - included trajectory scan redefinitions of standard scan macro commands as
+    private definitions within this macro file.
+  - Updated documentation to use the Sphinx specdomain markup.
+
+  2014-02-05 (CS):
+
+  - Another major overhaul to include new functionality and to make addition
+    of more detectors or special user code easier:
+      * (almost) real time plotting in SPEC.
+      * Graceful aborting of trajectory scans and saving of already recorded
+        data.
+      * User-definable macro hooks at strategic places (see documentation
+        above).
+
+  2014-05-22 (CS):
+
+  - Adapted to changes made in the XPS trajectory scanning code.
+
+  2015-04-16 (CS):
+
+  - Expanded and improved documentation.
+  - Added :spec:def:`trajectoryscan_undef` for self-destruction.
+  
+  2015-06-23 (PJE):
+  - Added MCA stop to _trajectoryscan_mcs_init since in some case the MCA
+    is acquiring when we want use to in a trajectory scan
+
+  2017-02-07 (JAK):
+  - Updated for spec release 6.04.X which replaced _ascan with different 
+    supporting base code for scans. 
+    
+  2017-10-03 (PJE) 
+  - Added fix for "Undefined" status message problem 
+  
+  2018-10-03 (PJE)
+  - Changed how the MCS array is read after a traj scan.  Resulting in putting
+    the 2nd element of the MCA in the the SPEC data array. This was done 
+    together with changing the MCS "Count on start" from "No" to "Yes" in 
+    the function "_trajectoryscan_mcs_init".
+    
+    These two changes together results in the MCS advancing from channel 0 to 
+    channel 1 when the 1st XPS pulse arrives resulting in the MCS sending a
+    trigger pulse to the Pilatus.  With this change the MCS counts in channel
+    1 correspond to the first Pilatus exposure.  
+
+TO DO:
+
+  - Sometimes trajectoryscans are not aborted cleanly, needs to be
+    investigated.
+  - Consolidate this with trajectory scan support for MaxV and DeltaTau
+    controllers.
+
+KNOWN BUGS:
+
+  - none so far
+
+"""
+
+
+#==============================================================================
+# Global variable definitions
+#==============================================================================
+
+#------------------
+# General variables
+
+#: Name of the trajectoryscan macro file [str]
+global TRAJECTORYSCAN_MAC
+       TRAJECTORYSCAN_MAC = DOFILE;
+
+#: Debug level (binary flag) [int]
+global TRAJECTORYSCAN_DEBUG
+       TRAJECTORYSCAN_DEBUG = 0
+
+#: Flag to signal whether trajectory scanning is enabled [int]
+global TRAJECTORYSCAN_IS_ON
+       TRAJECTORYSCAN_IS_ON = 0
+
+#: Flag to signal if actual motor positions are read [int]
+global TRAJECTORYSCAN_USE_ACTUAL
+       TRAJECTORYSCAN_USE_ACTUAL = 1
+
+#: Select position which is saved for trajectory elements (avg/start/end) [int]
+global TRAJECTORYSCAN_POS_MODE
+       TRAJECTORYSCAN_POS_MODE = 0
+
+#: Update interval in seconds for scan plots during trajectory scans [double]
+global TRAJECTORYSCAN_READ_INTERVAL
+       TRAJECTORYSCAN_READ_INTERVAL = 1.0
+
+#: Maximum wait time for EPICS callbacks in seconds [double]
+global TRAJECTORYSCAN_EPICS_TIMEOUT
+       TRAJECTORYSCAN_EPICS_TIMEOUT = 10.0
+
+
+#------------------------------------
+# EPICS trajectory support and motors
+
+#: Prefix of the trajectory scan IOC
+global TRAJECTORYSCAN_PV_PREFIX
+
+#: Name of the trajectory scan motor group [str]
+global TRAJECTORYSCAN_XPS_GROUP_NAME
+
+#: Array with the trajectory scan motor numbers [int]
+global TRAJECTORYSCAN_MOTOR_NUM[]
+
+#: File name of the trajectory file [str]
+global TRAJECTORYSCAN_FILE_NAME
+
+#: Max number of trajectory elements [int]
+global TRAJECTORYSCAN_MAX_ELEMENTS
+
+
+#-----------------
+# MCS and counters
+
+#: Prefix of the MCS IOC [str]
+global TRAJECTORYSCAN_MCS_PV_PREFIX
+
+#: Max number of MCS channel inputs [int]
+global TRAJECTORYSCAN_MCS_MAX_INPUTS
+
+#: Associate array of MCA input numbers for each scaler [int]
+global TRAJECTORYSCAN_MCS_SCALER_INPUT[]
+
+#: Maximum number of channels (scan points) for the MCS [int]
+global _TRAJECTORYSCAN_MCS_MAX_CHANNELS
+
+#: Current point number for MCS acquisition [int]
+global TRAJECTORYSCAN_MCS_CURRENT_POINT
+
+#: Reference clock frequency (Hz) [flaot]
+global TRAJECTORYSCAN_CLOCK_SCALE
+
+
+#----------------------------------------------------
+# Internal global variables used to build scan arrays
+
+#: Array with the trajectory scan motor column indices [int]
+global _TRAJECTORYSCAN_MOTOR_COL[]
+
+#: Associate array holding the move flags for all motors [int]
+global _TRAJECTORYSCAN_MOVE[]
+
+#: Array holding the motor positions sent to the trajectory for each pulse [float]
+global _TRAJECTORYSCAN_POS_SEND
+
+#: Array holding the motor positions (calculated or actual) at each pulse [float]
+global _TRAJECTORYSCAN_POS
+
+#: Array holding the averaged motor positions for each element [float]
+global _TRAJECTORYSCAN_FINAL_POS
+
+#: Array holding trajectory element count times [float]
+global _TRAJECTORYSCAN_TIME
+
+
+#------------------------------------------------------------------------------
+# Set some default values for the hardware-dependent global variables
+# (should be changed according to needs at startup in site_startup.mac)
+
+#------------------------------------
+# EPICS trajectory support and motors
+
+TRAJECTORYSCAN_PV_PREFIX = "BL:Prof1:"
+TRAJECTORYSCAN_XPS_GROUP_NAME = "GROUP1"
+TRAJECTORYSCAN_FILE_NAME = "Profilescan.trj"
+
+# The trajectoryscan motor number for each scanable motor.
+# E.g.: for motor "M1", the motor number should be "1".
+# User "-1" for pseudo motors
+TRAJECTORYSCAN_MOTOR_NUM["kphi"] = 1
+TRAJECTORYSCAN_MOTOR_NUM["kap"]  = 2
+TRAJECTORYSCAN_MOTOR_NUM["keta"] = 3
+TRAJECTORYSCAN_MOTOR_NUM["mu"]   = 4
+TRAJECTORYSCAN_MOTOR_NUM["del"]  = 5
+TRAJECTORYSCAN_MOTOR_NUM["nu"]   = 6
+TRAJECTORYSCAN_MOTOR_NUM["eta"]  = -1
+TRAJECTORYSCAN_MOTOR_NUM["chi"]  = -1
+TRAJECTORYSCAN_MOTOR_NUM["phi"]  = -1
+
+
+#----
+# MCS
+
+# The MCS channel number for each scaler.
+TRAJECTORYSCAN_MCS_SCALER_INPUT[0] = 1  # SPEC Scaler 0 on MCS channel 1
+TRAJECTORYSCAN_MCS_SCALER_INPUT[1] = 2  # SPEC Scaler 1 on MCS channel 2
+TRAJECTORYSCAN_MCS_SCALER_INPUT[2] = 3  # ...
+TRAJECTORYSCAN_MCS_SCALER_INPUT[3] = 4
+TRAJECTORYSCAN_MCS_SCALER_INPUT[4] = 5
+TRAJECTORYSCAN_MCS_SCALER_INPUT[5] = 6
+TRAJECTORYSCAN_MCS_SCALER_INPUT[6] = 7
+TRAJECTORYSCAN_MCS_SCALER_INPUT[7] = 8
+
+TRAJECTORYSCAN_MCS_PV_PREFIX = "BL:MCS1:"
+TRAJECTORYSCAN_MCS_MAX_INPUTS = 8
+
+TRAJECTORYSCAN_MAX_ELEMENTS   = 10100
+TRAJECTORYSCAN_CLOCK_SCALE    = counter_par(sec,"scale")
+
+
+#==============================================================================
+# Clone some original macro definitions from standard.mac
+#==============================================================================
+
+# Clone these only if they are not already available
+if(!(is_macro("_trajectoryscan_step_ascan"))){
+
+  printf("Saving original scan macro definitions.\n")
+
+  if(!(is_macro("_trajectoryscan_step_ascan"))){
+    clone("_trajectoryscan_step_ascan", "_ascan")
+  }
+  if(!(is_macro("trajectoryscan_step_ascan"))){
+    clone("trajectoryscan_step_ascan", "ascan")
+  }
+  if(!(is_macro("_trajectoryscan_step_mesh"))){
+    clone("_trajectoryscan_step_mesh", "mesh")
+  }
+  if(!(is_macro("_trajectoryscan_step_hklscan"))){
+    clone("_trajectoryscan_step_hklscan", "hklscan")
+  }
+  if(!(is_macro("_trajectoryscan_step_hklline"))){
+    clone("_trajectoryscan_step_hklline", "_hklline")
+  }
+  if(!(is_macro("_trajectoryscan_step_hklmesh"))){
+    clone("_trajectoryscan_step_hklmesh", "_hklmesh")
+  }
+  if(!(is_macro("_trajectoryscan_step_scanabort"))){
+    clone("_trajectoryscan_step_scanabort", "_scanabort")
+  }
+  if(!(is_macro("_trajectoryscan_step_resume"))){
+    clone("_trajectoryscan_step_resume", "resume")
+  }
+  if(!(is_macro("_trajectoryscan_orig_count"))){
+    clone("_trajectoryscan_orig_count", "_count")
+  }
+}
+
+
+#==============================================================================
+# Public macro definitions
+#==============================================================================
+
+#------------------------------------------------------------------------------
+def trajectoryscan_help '{
+  """
+  Display the trajectory scan help text.
+
+  USAGE::
+
+    > trajectoryscan_help
+
+  """
+
+  printf("\n  Macros available in file trajectoryscan_XPS.mac:\n")
+  printf(  "                           =======================\n")
+  printf("\n")
+  printf("  trajectoryscan_help    - display this help text\n")
+  printf("  trajectoryscan_show    - display the trajectory scan settings\n")
+  printf("  trajectoryscan_on      - turn on trajectory scanning\n")
+  printf("  trajectoryscan_off     - turn off trajectory scanning\n")
+  printf("  trajectoryscan_setup   - set up trajectory scanning parameters\n")
+  printf("  trajectoryscan_add     - add the trajectory scan capability to\n")
+  printf("                           SPEC (run once)\n")
+  printf("  trajectoryscan_remove  - remove trajectory scan macro hooks\n")
+  printf("  trajectoryscan_undef   - whipe all trajectoryscan definitions\n")
+}'
+
+
+#------------------------------------------------------------------------------
+def trajectoryscan_show '{
+  """
+  Display the current trajectoryscan settings.
+  """
+
+  printf("\n")
+  if(TRAJECTORYSCAN_IS_ON){
+    printf("Trajectory scans are currently ENABLED.\n")
+  } else {
+    printf("Trajectory scans are currently DISABLED.\n")
+  }
+
+  _trajectoryscan_print_setup
+
+}'
+
+
+
+#------------------------------------------------------------------------------
+def trajectoryscan_on '{
+  """
+  Turn on trajectory scanning.
+
+  USAGE::
+
+    > trajectoryscan_on
+
+  NOTE:
+    Before enabling trajectory scanning with :spec:def:`trajectoryscan_on`
+    for the first time after a fresh start of SPEC, it is necessary to put the
+    required macro definitions and user-hooks into place by calling
+    :spec:def:`trajectoryscan_add`. This has to be done only once. After that,
+    use :spec:def:`trajectoryscan_on` and :spec:def:`trajectoryscan_off` to
+    enable/disable trajectory scanning.
+
+  """
+
+  local _pv
+
+  # Overwrite the standard scan macro definitions with their corresponding
+  # trajectory scan versions
+  if(!is_macro("_angle_scan_prep")){
+    # spec versions prior to 6.04.01 use _ascan
+    clone("_ascan", "_trajectoryscan_ascan")
+    clone("mesh", "_trajectoryscan_mesh")
+    clone("hklscan", "_trajectoryscan_hklscan")
+    #clone("_hklline", "_trajectoryscan_hklline")
+    #clone("_hklmesh", "_trajectoryscan_hklmesh")
+    clone("_scanabort", "_trajectoryscan_scanabort")
+    clone("resume", "_trajectoryscan_resume")
+  } else {
+    # spec versions since 6.04.01 use _array_scan instead
+    #!clone("_angle_scan_prep", "_trajectoryscan_ascan")
+    clone("ascan", "trajectoryscan_ascan")
+    clone("mesh", "_trajectoryscan_mesh")
+    clone("hklscan", "_trajectoryscan_hklscan")
+    #clone("_hklmesh", "_trajectoryscan_hklmesh")
+    #clone("_hklline", "_trajectoryscan_hklline")
+    clone("_scanabort", "_trajectoryscan_scanabort")
+    clone("resume", "_trajectoryscan_resume")
+  }
+
+  # Check the maximum number of allowable trajectory elements
+  _pv = TRAJECTORYSCAN_PV_PREFIX "Times.NELM"
+  TRAJECTORYSCAN_MAX_ELEMENTS = epics_get(_pv)
+
+  # Set the trajectory scan flag to ON
+  TRAJECTORYSCAN_IS_ON = 1;
+
+  printf("Trajectory scanning has been ENABLED.\n")
+
+  # Initialize the MCS
+  _trajectoryscan_mcs_init
+
+  # Run user-defined initialization macros
+  _trajectoryscan_user_init
+
+}'
+
+
+#------------------------------------------------------------------------------
+def trajectoryscan_off '{
+  """
+  Turn off trajectory scanning.
+
+  USAGE::
+
+    > trajectoryscan_off
+
+  """
+
+  local _file, _dir, _ll
+
+  # Restore the standard macro definitions for the scan macros
+  if(!is_macro("_angle_scan_prep")) {
+    clone("_ascan", "_trajectoryscan_step_ascan")
+    clone("mesh", "_trajectoryscan_step_mesh")
+    clone("hklscan", "_trajectoryscan_step_hklscan")
+    #clone("_hklmesh", "_trajectoryscan_step_hklmesh")
+    #clone("_hklline", "_trajectoryscan_step_hklline")
+    clone("_scanabort", "_trajectoryscan_step_scanabort")
+    clone("resume", "_trajectoryscan_step_resume")
+  } else {
+    # spec versions since 6.04.01 use _angle_scan_prep/_array_scan instead
+    #!clone("_angle_scan_prep", "_trajectoryscan_step_ascan")
+    clone("ascan", "trajectoryscan_step_ascan")
+    clone("mesh", "_trajectoryscan_step_mesh")
+    clone("hklscan", "_trajectoryscan_step_hklscan")
+    #clone("_hklmesh", "_trajectoryscan_hklmesh")
+    #clone("_hklline", "_trajectoryscan_hklline")
+    clone("_scanabort", "_trajectoryscan_step_scanabort")
+    clone("resume", "_trajectoryscan_step_resume")
+
+  }
+
+
+  # Set the trajectory scan flag to OFF
+  TRAJECTORYSCAN_IS_ON = 0;
+
+  printf("Trajectory scanning has been DISABLED.\n")
+
+}'
+
+
+#------------------------------------------------------------------------------
+def trajectoryscan_setup '{
+  """
+  Set up the trajectoryscan parameters.
+
+  USAGE::
+
+    > trajectoryscan_setup
+
+  """
+
+  local _setup_numitems, _setup_option, _tmp_option, _str1
+
+  # total number of setup items
+  _setup_numitems = 8
+
+  _clear_screen
+
+  _setup_option = 0
+  _tmp_option = -1
+  while (_tmp_option) {
+      _tmp_option = -1
+      while (_tmp_option < 0 || _tmp_option > _setup_numitems){
+          tty_cntl("ho")  # home cursor on left upper corner of screen
+          tty_cntl("cd")  # clear the rest of the screen
+          _trajectoryscan_print_setup
+          _str1 = sprintf("Enter 1-%d to change the parameters, 0 to quit",\
+            _setup_numitems)
+          _tmp_option = getval(_str1, _setup_option)
+          if(index(_tmp_option, "q") == 1 || index(_tmp_option, "Q") == 1){
+            _tmp_option = 0
+          }
+      }
+      _setup_option = _tmp_option
+      if (_setup_option != 0){
+          _trajectoryscan_set_option _setup_option
+      }
+      _setup_option = (_tmp_option + 1)%(_setup_numitems + 1)
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def trajectoryscan_add '{
+  """
+  Add the trajectoryscan functionality to SPEC.
+
+  DESCRIPTION:
+    This routine adds the necessary macro definitions in SPEC to make
+    trajectory scanning possible. It has to be run once after
+    trajectoryscan.mac has been loaded::
+
+      > qdo trajectoryscan_xps.mac
+      > trajectoryscan_add
+
+  NOTE:
+    :spec:def:`trajectoryscan_add` does not enable trajectory scanning, but
+    merely puts everything in place that is required for a trajectory scan.
+    To enable trajectory scanning, use :spec:def:`trajectoryscan_on`, and
+    :spec:def:`trajectoryscan_off` to disable it again.
+
+  SEE ALSO:
+    :spec:def:`trajectoryscan_on`,
+    :spec:def:`trajectoryscan_off`
+
+  """
+
+  # During trajectoryscans, we need to suppress the actual counting command in
+  # SPEC since trajectory scans take care of that themselves. This is done by
+  # redefining the :spec:def:`_count` macro, which in a standard SPEC setup is
+  # defined the following way:
+  #   def _count \'_ord_count\'
+  # Here, we insert a call to a function
+  # :spec:def:`_trajectoryscan_count_func()`, which contains the call to the
+  # standard :spec:def:`_ord_count`, unless it is redefined by the
+  # trajectory scan to do nothing at all (see spec:def:`_trajectoryscan_init`
+  # and :spec:def:`_trajectoryscan_finish`).
+  rdef _count \'_arg = $$1; _trajectoryscan_count_func(_arg);\'
+  rdef _trajectoryscan_count_func(_arg) \'
+    if(_arg){
+      _ord_count _arg
+    } else {
+      _ord_count
+    }
+  \'
+
+  # Initialize a dummy routine for saving data. This will be overwritten
+  # by the actual scan commands.
+  rdef _trajectoryscan_savedata_func(npts) \'{printf(""); local _dummy;  _dummy = npts }\'
+
+  # run user-defined initialization procedures
+  _trajectoryscan_user_add
+
+}'
+
+
+#------------------------------------------------------------------------------
+def trajectoryscan_remove '{
+  """
+  Remove the trajectoryscan functionality from SPEC.
+  """
+
+  # Turn off trajectory scanning, just in case
+  trajectoryscan_off
+
+  # Restore the standard _count command with the saved original definition:
+  clone("_count", "_trajectoryscan_orig_count")
+
+  # run user-defined remove procedures
+  _trajectoryscan_user_remove
+
+}'
+
+
+#------------------------------------------------------------------------------
+def trajectoryscan_undef '{
+  """
+  Completely remove the trajectory scanning functionality from
+  SPEC, including all macro definitions and global variable declarations.
+
+  DESCRIPTION:
+    Calling :spec:def:`trajectoryscan_undef` will remove all of the trajectory
+    scan macros and variable definitions from SPEC. In essence, this undoes the
+    `do trajectoryscan_xps.mac` call issued when loading this macro.
+
+  USAGE::
+
+    > trajectoryscan_undef
+
+  SEE ALSO:
+
+    * :spec:def:`trajectoryscan_remove`,
+    * :spec:def:`trajectoryscan_off`
+
+  """
+
+  # call :spec:def:`trajectoryscan_remove` first.
+  trajectoryscan_remove
+
+  # unglobal the global variable definitions
+  unglobal TRAJECTORYSCAN_MAC
+  unglobal TRAJECTORYSCAN_DEBUG
+  unglobal TRAJECTORYSCAN_IS_ON
+  unglobal TRAJECTORYSCAN_USE_ACTUAL
+  unglobal TRAJECTORYSCAN_POS_MODE
+  unglobal TRAJECTORYSCAN_READ_INTERVAL
+  unglobal TRAJECTORYSCAN_EPICS_TIMEOUT
+  unglobal TRAJECTORYSCAN_PV_PREFIX
+  unglobal TRAJECTORYSCAN_XPS_GROUP_NAME
+  unglobal TRAJECTORYSCAN_MOTOR_NUM
+  unglobal TRAJECTORYSCAN_FILE_NAME
+  unglobal TRAJECTORYSCAN_MAX_ELEMENTS
+  unglobal TRAJECTORYSCAN_MCS_PV_PREFIX
+  unglobal TRAJECTORYSCAN_MCS_MAX_INPUTS
+  unglobal TRAJECTORYSCAN_MCS_SCALER_INPUT
+  unglobal _TRAJECTORYSCAN_MCS_MAX_CHANNELS
+  unglobal TRAJECTORYSCAN_MCS_CURRENT_POINT
+  unglobal TRAJECTORYSCAN_CLOCK_SCALE
+  unglobal _TRAJECTORYSCAN_MOTOR_COL
+  unglobal _TRAJECTORYSCAN_MOVE
+  unglobal _TRAJECTORYSCAN_POS_SEND
+  unglobal _TRAJECTORYSCAN_POS
+  unglobal _TRAJECTORYSCAN_FINAL_POS
+  unglobal _TRAJECTORYSCAN_TIME
+
+  # undefine the macro definitions
+  undef trajectoryscan_help
+  undef trajectoryscan_show
+  undef trajectoryscan_on
+  undef trajectoryscan_off
+  undef trajectoryscan_setup
+  undef trajectoryscan_add
+  undef trajectoryscan_remove
+  undef trajectoryscan_undef
+  undef trajectoryscan_ascan
+  undef _trajectoryscan_ascan
+  undef _trajectoryscan_savedata_ascan
+  undef _trajectoryscan_mesh
+  undef _trajectoryscan_savedata_mesh
+  undef _trajectoryscan_hklscan
+  undef _trajectoryscan_savedata_hklscan
+  undef _trajectoryscan_scanabort
+  undef _trajectoryscan_resume
+  undef _trajectoryscan_print_setup
+  undef _trajectoryscan_set_option
+  undef _trajectoryscan_pre_check
+  undef _trajectoryscan_init
+  undef _trajectoryscan_mcs_init
+  undef _trajectoryscan_arm
+  undef _trajectoryscan_mcs_arm
+  undef _trajectoryscan_build
+  undef _trajectoryscan_run
+  undef _trajectoryscan_is_running
+  undef _trajectoryscan_mcs_stop
+  undef _trajectoryscan_mcs_wait
+  undef _trajectoryscan_get_data
+  undef _trajectoryscan_get_current_point
+  undef _trajectoryscan_mcs_get_data
+  undef _trajectoryscan_mcs_read_counts
+  undef _trajectoryscan_read_positions
+  undef _trajectoryscan_read_actual
+  undef _trajectoryscan_plot
+  undef _trajectoryscan_finish
+  undef _trajectoryscan_abort
+  undef _trajectoryscan_check_motor
+  undef _trajectoryscan_is_real_motor
+  undef _trajectoryscan_has_pseudo_motor
+  undef _trajectoryscan_resume
+  undef _trajectoryscan_user_add
+  undef _trajectoryscan_user_remove
+  undef _trajectoryscan_user_init
+  undef _trajectoryscan_user_arm
+  undef _trajectoryscan_user_pre_run
+  undef _trajectoryscan_user_post_run
+  undef _trajectoryscan_user_wait
+  undef _trajectoryscan_user_get_data
+  undef _trajectoryscan_user_read_counts
+  undef _trajectoryscan_user_savedata
+  undef _trajectoryscan_user_finish
+  undef _trajectoryscan_user_pre_abort
+  undef _trajectoryscan_user_post_abort
+
+}'
+
+#==============================================================================
+# Substitute definitions of standard scan macros for trajectory scanning
+#==============================================================================
+
+#------------------------------------------------------------------------------
+def trajectoryscan_ascan '{
+  """
+  Mid-level macro for an absolute scan.
+
+  NOTE:
+    This is a replacement for :spec:def:`ascan`, :spec:def:`dscan`, etc.
+
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: trajectoryscan_ascan\n")
+    printf(" Start time: %s\n", date())
+    _time = time()
+  }
+
+  if ($# != 5) {
+     eprint "Usage:  ascan  motor start finish  intervals time"
+     exit
+  }              
+  _check0 "$1"
+  _m[0] = $1; _s[0] = $2; _f[0] = $3
+  _n1 = int($4); _ctime = $5
+  _nm = 1
+
+  _trajectoryscan_ascan
+
+}'
+
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_ascan '{
+  """
+  Low-level macro for an absolute scan.
+
+  NOTE:
+    This is used by :spec:def:`ascan`, :spec:def:`dscan`, etc.
+
+    :spec:def:`_ascan` scans the number of motors given by _nm. The arrays
+    _m[], _s[], _f[] and _d[] contain the motor numbers, start, finish and step
+    sizes for each of the scanned motors. The macros :spec:def:`ascan`,
+    :spec:def:`a2scan`, :spec:def:`a3scan` and :spec:def:`a4scan` call
+    :spec:def:`_ascan`.
+
+  """
+
+  local i, j, k, dt, all_real, _npts, _time, _has_pseudo
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_ascan\n")
+    printf(" Start time: %s\n", date())
+    _time = time()
+  }
+
+  if(_n1 <= 0){
+    eprint "Intervals <= 0"
+    exit
+  }
+
+  # Check limits and motor types on all scan motors
+  all_real = 1
+  for(i = 0; i < _nm; i++){
+    _bad_lim = 0
+    _chk_lim _m[i] _s[i]
+    _chk_lim _m[i] _f[i]
+    if (_bad_lim) exit;
+
+    # Check if this is a valid trajectoryscan motor, otherwise do a normal
+    # step scan.
+    if(!(_trajectoryscan_check_motor(_m[i]))){
+      printf("\n*********************************************\n")
+      printf("WARNING: %s can not be used in trajectory-scan mode!\n", \
+          motor_mne(_m[i]))
+      printf("  SPEC will start a standard step scan instead in 1 seconds.")
+      printf("  Hit Ctrl+C now to abort.\n")
+      sleep(1.0)
+      _trajectoryscan_step_ascan
+      return
+    }
+
+    # Check if motor is a pseudo_motor, if yes clear the all_real flag
+    if(!(_trajectoryscan_is_real_motor(_m[i]))){
+      all_real = 0
+    }
+  }
+
+  # Run some checks to see if scan parameters are valid
+  _trajectoryscan_pre_check
+
+  HEADING = _nm > 1 ? sprintf("a%dscan ", _nm) : "ascan "
+
+  for(i = 0; i < _nm; i++){
+    HEADING = sprintf("%s%s", HEADING, sprintf(" %s %g %g ",\
+                motor_mne(_m[i]), _s[i], _f[i]))
+    _d[i] = (_f[i] - _s[i]) / _n1
+  }
+
+  HEADING = sprintf("%s %g %g", HEADING, _n1, _ctime)
+  _cols = _nm + _hkl_col
+  X_L = motor_name(_m[0])
+  Y_L = cnt_name(DET)
+  _sx = _s[0]; _fx = _f[0]
+  _stype = 1|(_nm<<8)
+  FPRNT = PPRNT = VPRNT = ""
+  for(i = 0; i < _nm; i++){
+    FPRNT = sprintf("%s%s  ", FPRNT, motor_name(_m[i]))
+    PPRNT = sprintf("%s%8.8s ", PPRNT, motor_name(_m[i]))
+    VPRNT = sprintf("%s%9.9s ", VPRNT, motor_name(_m[i]))
+  }
+  FPRNT = sprintf("%s%s  ", FPRNT, _hkl_sym1)
+  PFMT = sprintf("%%s%%8.%df ", UP)
+  VFMT = sprintf("%%s%%9.%df ", UP)
+
+  scan_head
+
+  # Move to start position of scan
+  for(i = 0; i < _nm; i++) A[_m[i]] = _s[i]
+  scan_move
+
+  # Initialize trajectory scan
+  _trajectoryscan_init
+
+  # Arm detectors, counters, etc.
+  _trajectoryscan_arm
+
+  # Calculate the nominal positions for all motors.
+  # Real motors are set first, then pseudo-motors are calculated (if is_kappa)
+  _has_pseudo = _trajectoryscan_has_pseudo_motor()
+  for(_npts = 0; _npts < _n1+1; _npts++){
+    for(i = 0; i <_nm; i++){
+      A[_m[i]] = _s[i] + (_npts) * _d[i]
+    }
+    if(is_kappa | _has_pseudo){
+      if(all_real){
+        # calculate pseudo-angles from real angles
+        calcP_fromR
+      } else {
+        # calculate real angles from pseudo-angles
+        # We assume the user is not asking for mutually incompatible real and
+        # pseudo-angles.
+        calcR_fromP
+      }
+    }
+    for(_mne in _TRAJECTORYSCAN_MOTOR_COL){
+      k = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+      _TRAJECTORYSCAN_POS[k][_npts] = A[motor_num(_mne)]
+    }
+  }
+
+  # Construct the trajectory.
+  # If all motors being scanned are real motors, we optimize.
+  if(all_real){
+    if(TRAJECTORYSCAN_DEBUG){
+      printf("  Only real motors, simplifying trajectory\n")
+    }
+    for(i = 0; i < _nm; i++){
+      k = _TRAJECTORYSCAN_MOTOR_COL[motor_mne(_m[i])]
+      _TRAJECTORYSCAN_MOVE[motor_mne(_m[i])] = 1
+      _TRAJECTORYSCAN_POS_SEND[k][0] = _s[i]
+      _TRAJECTORYSCAN_POS_SEND[k][1] = _f[i]
+    }
+    dt = _n1 * _ctime
+    _TRAJECTORYSCAN_TIME[0] = dt
+    _TRAJECTORYSCAN_TIME[1] = dt
+
+    # Build the trajectory
+    _trajectoryscan_build 2 _n1
+
+  } else {
+    if(TRAJECTORYSCAN_DEBUG){
+      printf("  Scanning pseudo-motors, using full trajectory definition \n")
+    }
+    for(_mne in _TRAJECTORYSCAN_MOTOR_COL) {
+      k = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+      _TRAJECTORYSCAN_POS_SEND[k][0:_npts-1] = _TRAJECTORYSCAN_POS[k][0:_npts-1]
+      if (_trajectoryscan_is_real_motor(_mne)){
+        _TRAJECTORYSCAN_MOVE[_mne] = 1
+      }
+    }
+    for(i = 0; i <= _n1; i++){
+      _TRAJECTORYSCAN_TIME[i] = _ctime
+    }
+
+    # Build the trajectory
+    _trajectoryscan_build _n1+1 _n1
+  }
+
+  # Load the correct data saving routine
+  # The redefinition of a macro function is somewhat of a workaround to a
+  # limitation of cdef, and assures that the redefinition happens
+  # instantaneously at this point in the macro rather than upon return to the
+  # command line prompt, which would be too late.
+  rdef _trajectoryscan_savedata_func(npts) \'{ _trajectoryscan_savedata_ascan npts}\'
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("Current _trajectoryscan_savedata_func definition:\n")
+    prdef _trajectoryscan_savedata_func
+  }
+
+  # Execute trajectory scan, read the data and plot the result
+  cdef("cleanup_once", "\n{_trajectoryscan_abort}; ", "trajectoryscan", "0x10")
+  _trajectoryscan_run
+
+  # Save the data
+  _trajectoryscan_savedata_func(_TRAJECTORYSCAN_MCS_CURRENT_POINT)
+
+  # Clean up after the trajectory scan
+  _trajectoryscan_finish
+  cdef("cleanup_once", "", "trajectoryscan", "delete")
+
+  comment "Trajectory scan completed"
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Trajectory scan completed.\n")
+    printf("  End time: %s\n", date())
+    printf("  Duration: %f seconds\n", time()-_time)
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_savedata_ascan '{
+  """
+  Save routine for _trajectoryscan_ascan.
+  """
+
+  local _has_pseudo, _mne, _i, _mcs_col
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_savedata_ascan\n")
+    printf("  Reading %d data points.\n", $1)
+  }
+
+  # Update all motor positions at the end of the scan. The scanned motor
+  # positions will be overwritten with the actual values in the loop below.
+  # For all other motors, it is assumed that they were stationary during the
+  # trajectory scan.
+  get_angles
+
+  # Update all counters with the values obtained at the end of the scan. The
+  # data for any "trajectory-scannable" counters will be inserted from the MCS or
+  # other source in the loop below. But we should do this to obtain information
+  # for any "static counters" that may be configured and for which the
+  # information does not change during a scan. For example, some setups may
+  # record the attenuator settings and transmission or the beamline energy for
+  # each scan point.
+  # In addition, we should run all of the standard measurement macros here
+  # (For example, the temperature measurement happens in measure1).
+  measure0
+  get_counts
+  measure1
+  measure2
+
+  # Reconstruct the data for individual scan points and let SPEC process them
+  # the usual way.
+  _has_pseudo = _trajectoryscan_has_pseudo_motor()
+  for(NPTS = 0; NPTS < ($1); NPTS++) {
+
+    if(TRAJECTORYSCAN_DEBUG & 2){
+      printf("  NPTS = %d\n", NPTS)
+    }
+
+    # Fill in the motor positions for each trajectoryscan element
+    for(_mne in _TRAJECTORYSCAN_MOTOR_COL){
+      _i = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+      if(TRAJECTORYSCAN_MOTOR_NUM[_mne] > 0){
+        A[motor_num(_mne)] = _TRAJECTORYSCAN_FINAL_POS[_i][NPTS]
+      }
+    }
+
+    # Calculate the pseudo angles from the real angles, if necessary
+    if(is_kappa | _has_pseudo){
+      calcP_fromR
+    }
+    calcHKL
+
+    # Fill in the counter information from the MCS
+    for (_cnt in TRAJECTORYSCAN_MCS_SCALER_INPUT) {
+      _mcs_col = TRAJECTORYSCAN_MCS_SCALER_INPUT[_cnt] - 1
+      S[cnt_num(_cnt)] = _TRAJECTORYSCAN_MCS_DATA[NPTS][_mcs_col]
+    }
+    S[sec] = S[sec] / TRAJECTORYSCAN_CLOCK_SCALE
+
+    # execute user-defined save routines
+    _trajectoryscan_user_savedata
+
+    # prepare data strings
+    FPRNT = PPRNT = VPRNT = ""
+    for (j = 0; j < _nm; j++){
+       FPRNT = sprintf("%s%.8g ", FPRNT, A[_m[j]])
+       PPRNT = sprintf(PFMT, PPRNT, A[_m[j]])
+       VPRNT = sprintf(VFMT, VPRNT, A[_m[j]])
+    }
+    FPRNT = sprintf("%s%s ", FPRNT, _hkl_val)
+
+    # Call the standard macro to write data to file
+    scan_loop
+  }
+  scan_tail
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_mesh '{
+  """
+  2-dimensional mesh scan (two-motor nested scan).
+
+  NOTE:
+    This version moves the outer loop (mot2 = slow motor) normally, and uses
+    trajectory scanning for the inner loop (mot1 = fast motor).  The trajectory is
+    built once and executed repeatedly.
+
+  """
+
+  local i, j, k, dt, all_real, _npts, _time, _has_pseudo
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_mesh\n")
+    printf(" Start time: %s\n", date())
+    _time = time()
+  }
+
+  if ($# != 9) {
+      eprint "\
+      Usage:  mesh  mot1 s1 f1 intervals1  mot2 s2 f2 intervals2  time"
+      exit
+  }
+  _check0 "$1"; _check0 "$5"
+  _m[0] = $1; _s1 = $2; _f1 = $3; _n1 = int($4)
+  _m[1] = $5; _s2 = $6; _f2 = $7; _n2 = int($8)
+  _ctime = $9
+  if (_n1 <= 0 || _n2 <= 0) {
+      eprint "Intervals <= 0"
+      exit
+  }
+
+  _bad_lim = 0
+  _chk_lim _m[0] _s1
+  _chk_lim _m[0] _f1
+  _chk_lim _m[1] _s2
+  _chk_lim _m[1] _f2
+  if (_bad_lim) exit
+
+  # Check if mot1 is a valid trajectoryscan motor, otherwise do a normal
+  # step scan.
+  if(!(_trajectoryscan_check_motor(_m[0]))){
+    printf("\n*********************************************\n")
+    printf("WARNING: %s can not be used in trajectory-scan mode!\n", \
+        motor_mne(_m[0]))
+    printf("  SPEC will start a standard step scan instead in 5 seconds.")
+    printf("  Hit Ctrl+C now to abort.\n")
+    sleep(5.0)
+    _trajectoryscan_step_mesh
+    return
+  }
+
+  # Check if motor is a pseudo_motor, if yes clear the all_real flag
+  all_real = 1
+  if(!(_trajectoryscan_is_real_motor(_m[0]))){
+    all_real = 0
+  }
+
+  # Run some checks to see if scan parameters are valid
+  _trajectoryscan_pre_check
+
+  HEADING = sprintf("mesh  $1 %g %g %g  $5 %g %g %g  %g",\
+                      $2, $3, $4, $6, $7, $8, $9)
+
+  _d1 = (_f1 - _s1) / _n1
+  _d2 = (_f2 - _s2) / _n2++
+  _nm=2
+  _cols=2+_hkl_col
+  X_L = "$1"; _sx = _s1; _fx = _f1
+  Y_L = cnt_name(DET)
+  _stype = 1|8|(2<<8)
+  FPRNT=sprintf("%s  %s  ",motor_name(_m[0]),motor_name(_m[1]))
+  PPRNT=sprintf("%8.8s %8.8s ",motor_name(_m[0]),motor_name(_m[1]))
+  VPRNT=sprintf("%9.9s %9.9s ",motor_name(_m[0]),motor_name(_m[1]))
+  FPRNT=sprintf("%s%s  ",FPRNT,_hkl_sym1)
+  scan_head
+  PFMT=sprintf("%%8.%df %%8.%df ",UP,UP)
+  VFMT=sprintf("%%9.%df %%9.%df ",UP,UP)
+
+  # Load the correct data saving routine
+  rdef _trajectoryscan_savedata_func(npts) \'{ _trajectoryscan_savedata_mesh npts}\'
+  cdef("cleanup_once", "\n{_trajectoryscan_abort}; ", "trajectoryscan", "0x10")
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("Current _trajectoryscan_savedata_func definition:\n")
+    prdef _trajectoryscan_savedata_func
+  }
+
+  # Outer loop over all motor positions for motor 2
+  _has_pseudo = _trajectoryscan_has_pseudo_motor()
+  NPTS = 0
+  for (_g2 = 0; _g2 < _n2; _g2++){
+    A[_m[1]] = _s2 + _g2 * _d2
+    A[_m[0]] = _s1
+
+    # Move motors to start of next trajectory
+    scan_move
+    waitmove
+    get_angles
+
+    # Initialize trajectory scan
+    _trajectoryscan_init
+
+    # Arm detectors, counters, etc.
+    _trajectoryscan_arm
+
+    # Calculate the nominal positions for mot1.
+    # Real motors are set first, then pseudo-motors are calculated (if is_kappa)
+    for(_npts = 0; _npts < _n1+1; _npts++){
+      A[_m[0]] = _s1 + (_npts) * _d1
+      if(is_kappa | _has_pseudo){
+        if(all_real){
+          # calculate pseudo-angles from real angles
+          calcP_fromR
+        } else {
+          # calculate real angles from pseudo-angles
+          # We assume the user is not asking for mutually incompatible real and
+          # pseudo-angles.
+          calcR_fromP
+        }
+      }
+      for(_mne in _TRAJECTORYSCAN_MOTOR_COL){
+        k = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+        _TRAJECTORYSCAN_POS[k][_npts] = A[motor_num(_mne)]
+      }
+    }
+
+    # Construct the trajectory for motor 1.
+    # If motor 1 is a real motor, we optimize.
+    if(all_real){
+      if(TRAJECTORYSCAN_DEBUG){
+        printf("  Only real motors, simplifying trajectory\n")
+      }
+      k = _TRAJECTORYSCAN_MOTOR_COL[motor_mne(_m[0])]
+      _TRAJECTORYSCAN_MOVE[motor_mne(_m[0])] = 1
+      _TRAJECTORYSCAN_POS_SEND[k][0] = _s1
+      _TRAJECTORYSCAN_POS_SEND[k][1] = _f1
+      dt = _n1 * _ctime
+      _TRAJECTORYSCAN_TIME[0] = dt
+      _TRAJECTORYSCAN_TIME[1] = dt
+
+      # Build the trajectory
+      _trajectoryscan_build 2 _n1
+
+    } else {
+      if(TRAJECTORYSCAN_DEBUG){
+        printf("  Scanning pseudo-motors, using full trajectory definition \n")
+      }
+      for(_mne in _TRAJECTORYSCAN_MOTOR_COL) {
+        k = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+        _TRAJECTORYSCAN_POS_SEND[k][0:_npts-1] = _TRAJECTORYSCAN_POS[k][0:_npts-1]
+        if (_trajectoryscan_is_real_motor(_mne)){
+          _TRAJECTORYSCAN_MOVE[_mne] = 1
+        }
+      }
+      for(i = 0; i <= _n1; i++){
+        _TRAJECTORYSCAN_TIME[i] = _ctime
+      }
+
+      # Build the trajectory
+      _trajectoryscan_build _n1+1 _n1
+    }
+
+    # Execute trajectory scan, read the data and plot the result
+    _trajectoryscan_run
+
+    # Save the data
+    _trajectoryscan_savedata_func(_TRAJECTORYSCAN_MCS_CURRENT_POINT)
+  }
+
+  scan_tail
+
+  # Clean up after the trajectory scan
+  _trajectoryscan_finish
+  cdef("cleanup_once", "", "trajectoryscan", "delete")
+
+  comment "Trajectory scan completed"
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Trajectory scan completed.\n")
+    printf("  End time: %s\n", date())
+    printf("  Duration: %f seconds\n", time()-_time)
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_savedata_mesh '{
+  """
+  Save routine for _trajectoryscan_mesh.
+  """
+
+  local _has_pseudo, _mne, _i, _g1
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_savedata_mesh\n")
+    printf("  Reading %d data points.\n", $1)
+  }
+
+  # Update all motor positions at the end of the scan. The scanned motor
+  # positions will be overwritten with the actual values in the loop below.
+  # For all other motors, it is assumed that they were stationary during the
+  # trajectory scan.
+  measure0
+  get_counts
+  measure1
+  measure2
+
+  # Update all counters with the values obtained at the end of the scan. The
+  # data for any "trajectory-scannable" counters will be inserted from the MCS or
+  # other source in the loop below. But we should do this to obtain information
+  # for any "static counters" that may be configured and for which the
+  # information does not change during a scan. For example, some setups may
+  # record the attenuator settings and transmission or the beamline energy for
+  # each scan point.
+  get_counts
+
+  # Reconstruct the data for individual scan points and let SPEC process them
+  # the usual way.
+  _has_pseudo = _trajectoryscan_has_pseudo_motor()
+  for(_g1 = 0; _g1 < _n1; _g1++, NPTS++) {
+
+    if(TRAJECTORYSCAN_DEBUG & 2){
+      printf("  NPTS = %d\n", NPTS)
+      printf("  _g1  = %d\n", _g1)
+    }
+
+    # Fill in the motor positions for each trajectoryscan element
+    for(_mne in _TRAJECTORYSCAN_MOTOR_COL){
+      _i = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+      if(TRAJECTORYSCAN_MOTOR_NUM[_mne] > 0){
+        A[motor_num(_mne)] = _TRAJECTORYSCAN_FINAL_POS[_i][_g1]
+      }
+    }
+
+    # Calculate the pseudo angles from the real angles, if necessary
+    if(is_kappa | _has_pseudo){
+      calcP_fromR
+    }
+    calcHKL
+
+    # Fill in the counter information from the MCS
+    for (_cnt in TRAJECTORYSCAN_MCS_SCALER_INPUT) {
+      S[cnt_num(_cnt)] = _TRAJECTORYSCAN_MCS_DATA[_g1][_cnt]
+    }
+    S[sec] = S[sec] / TRAJECTORYSCAN_CLOCK_SCALE
+
+    # execute user-defined save routines
+    _trajectoryscan_user_savedata
+
+    # prepare data strings
+    FPRNT=sprintf("%.8g %.8g ",A[_m[0]],A[_m[1]])
+    PPRNT=sprintf(PFMT,A[_m[0]],A[_m[1]])
+    VPRNT=sprintf(VFMT,A[_m[0]],A[_m[1]])
+    FPRNT=sprintf("%s%s ",FPRNT,_hkl_val)
+
+    # Call the standard macro to write data to file
+    scan_loop
+
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_hklscan '{
+  """
+  Linear reciprocal space scan macro.
+
+  NOTE:
+    Limit checking is done at the last point first, since limits are often
+    exceeded at the extreme points of a scan.
+  """
+
+  local i, j, h_ca, k_ca, l_ca, dp
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_hklscan\n")
+    printf(" Start time: %s\n", date())
+    _time = time()
+  }
+
+  if ($# != 8) {
+    eprint "Usage:  hklscan Hstart Hfinish Kstart Kfinish Lstart Lfinish intervals time"
+    exit
+  }
+  _s1 = $1; _f1 = $2; _s2 = $3; _f2 = $4; _s3 = $5; _f3 = $6
+  _n1 = int($7); _ctime = $8
+
+  if (_n1 <= 0) {
+    eprint "Intervals <= 0"
+    exit
+  }
+
+  HEADING = sprintf("hklscan  %g %g  %g %g  %g %g  %g %g", $1, $2, $3,\
+                      $4, $5, $6, $7, $8)
+  _d1 = (_f1 - _s1)/_n1
+  _d2 = (_f2 - _s2)/_n1
+  _d3 = (_f3 - _s3)/_n1
+
+  H=_f1; K=_f2; L=_f3
+  calcA; _bad_lim=0; _hkl_lim
+  if (_bad_lim) {
+    eprintf("(H K L = %g %g %g)\n",H,K,L)
+    exit
+  }
+  if (_pre_chk) {
+    for (i = 0 ; i < _n1 + 1; i++) {
+      H = _s1 + i*_d1
+      K = _s2 + i*_d2
+      L = _s3 + i*_d3
+      calcA
+      _bad_lim = 0
+      _hkl_lim
+      if (_bad_lim) {
+        eprintf("(H K L = %g %g %g)\n",H,K,L)
+        exit
+      }
+    }
+  }
+  _cols=3
+  if (_d3){
+    X_L = "L"; _sx = _s3; _fx = _f3
+  }
+  else if (_d2){
+    X_L = "K"; _sx = _s2; _fx = _f2
+  }
+  else{
+    X_L = "H"; _sx = _s1; _fx = _f1
+  }
+  Y_L = cnt_name(DET)
+  _stype = 2
+  FPRNT="H  K  L  "
+  PPRNT=""
+  {
+    local i, s
+    for (i=0; i<_numgeo; i++) {
+      s = motor_name(mA[i])
+      PPRNT = PPRNT sprintf("%8.8s ",s)
+      if (_sav_geo_mot){
+        FPRNT = FPRNT s "  "
+      }
+    }
+  }
+  VPRNT=sprintf("%10s %10s %10s ","H","K","L")
+  scan_head
+
+  # Initialize trajectory scan
+  _trajectoryscan_init
+
+  # Arm detectors, counters, etc.
+  _trajectoryscan_arm
+
+  # Define motors which will be moved
+  for(i=0; i<TRAJECTORYSCAN_MAX_INDEX; i++) {
+    k = TRAJECTORYSCAN_INDEX[i]
+    if (k < 0) continue
+    _trajectoryscan_move[k]=1
+  }
+
+  # Move to start of trajectory, remember positions
+  H=_s1; K=_s2; L=_s3;
+  get_angles; calcA
+  scan_move
+
+  # Calculate the trajectory positions
+  for (_npts = 0; _npts < _n1 + 1; _npts++) {
+    H = h_ca = _s1 + (_npts)*_d1
+    K = k_ca = _s2 + (_npts)*_d2
+    L = l_ca = _s3 + (_npts)*_d3
+    get_angles; calcA
+    for(_mne in _TRAJECTORYSCAN_MOTOR_COL){
+      k = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+      _TRAJECTORYSCAN_POS[k][_npts] = A[motor_num(_mne)]
+    }
+    _TRAJECTORYSCAN_TIME[_npts] = _ctime
+  }
+  for(_mne in _TRAJECTORYSCAN_MOTOR_COL) {
+    k = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+    _TRAJECTORYSCAN_POS_SEND[k][0:_npts-1] = _TRAJECTORYSCAN_POS[k][0:_npts-1]
+    if (_trajectoryscan_is_real_motor(_mne)){
+      _TRAJECTORYSCAN_MOVE[_mne] = 1
+    }
+  }
+
+  # Build the trajectory
+  _trajectoryscan_build _n1+1 _n1
+
+  # Load the correct data saving routine
+  rdef _trajectoryscan_savedata_func(npts) \'{ _trajectoryscan_savedata_hklscan npts}\'
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("Current _trajectoryscan_savedata_func definition:\n")
+    prdef _trajectoryscan_savedata_func
+  }
+
+  # Execute trajectory scan
+  cdef("cleanup_once", "\n{_trajectoryscan_abort}; ", "trajectoryscan", "0x10")
+  _trajectoryscan_run
+
+  # Save the data
+  _trajectoryscan_savedata_func(_TRAJECTORYSCAN_MCS_CURRENT_POINT)
+
+  # Clean up after the trajectory scan
+  _trajectoryscan_finish
+  cdef("cleanup_once", "", "trajectoryscan", "delete")
+
+  comment "Trajectory scan completed"
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Trajectory scan completed.\n")
+    printf("  End time: %s\n", date())
+    printf("  Duration: %f seconds\n", time()-_time)
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_savedata_hklscan '{
+  """
+  Save routine for _trajectoryscan_hklscan.
+  """
+
+  local _mne, _i
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_savedata_hklscan\n")
+    printf("  Reading %d data points.\n", $1)
+  }
+
+  # Update all motor positions at the end of the scan. The scanned motor
+  # positions will be overwritten with the actual values in the loop below.
+  # For all other motors, it is assumed that they were stationary during the
+  # trajectory scan.
+  get_angles
+
+  # Update all counters with the values obtained at the end of the scan. The
+  # data for any "trajectory-scannable" counters will be inserted from the MCS or
+  # other source in the loop below. But we should do this to obtain information
+  # for any "static counters" that may be configured and for which the
+  # information does not change during a scan. For example, some setups may
+  # record the attenuator settings and transmission or the beamline energy for
+  # each scan point.
+  measure0
+  get_counts
+  measure1
+  measure2
+
+  # Reconstruct the data for individual scan points and let SPEC process them
+  # the usual way.
+  _has_pseudo = _trajectoryscan_has_pseudo_motor()
+  for(NPTS = 0; NPTS < ($1); NPTS++) {
+
+    if(TRAJECTORYSCAN_DEBUG & 2){
+      printf("  NPTS = %d\n", NPTS)
+    }
+
+    # Fill in the motor positions for each trajectoryscan element
+    for(_mne in _TRAJECTORYSCAN_MOTOR_COL){
+      _i = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+      if(TRAJECTORYSCAN_MOTOR_NUM[_mne] > 0){
+        A[motor_num(_mne)] = _TRAJECTORYSCAN_FINAL_POS[_i][NPTS]
+      }
+    }
+
+    # Calculate the pseudo angles from the real angles, if necessary
+    if(is_kappa | _has_pseudo){
+      calcP_fromR
+    }
+    calcHKL
+
+    # Fill in the counter information from the MCS
+    for (_cnt in TRAJECTORYSCAN_MCS_SCALER_INPUT) {
+      S[cnt_num(_cnt)] = _TRAJECTORYSCAN_MCS_DATA[NPTS][_cnt]
+    }
+    S[sec] = S[sec] / TRAJECTORYSCAN_CLOCK_SCALE
+
+    # execute user-defined save routines
+    _trajectoryscan_user_savedata
+
+    # prepare data strings
+    FPRNT = sprintf("%g %g %g ", H, K, L)
+    PPRNT = ""
+    for (i = 0; i < _numgeo; i++) {
+      PPRNT = PPRNT sprintf("%8.4f ", A[mA[i]])
+      if (_sav_geo_mot)
+        FPRNT = FPRNT sprintf("%.8g ", A[mA[i]])
+    }
+    VPRNT = sprintf("%10.5g %10.5g %10.5g ", H, K, L)
+
+    # Call the standard macro to write data to file
+    scan_loop
+  }
+  scan_tail
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_scanabort '{
+  """
+  Cleanup macro used by all of the scans.
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_scanabort\n")
+  }
+
+  _cleanup2
+  _cleanup3
+  sync
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_resume '{
+  """
+  Resume usually restarts aborted scans. For trajectory scans, resume is currently
+  not supported.
+
+  NOTE:
+    How exactly would one resume an aborted trajectory scan? Start a new scan from
+    where the old one stopped?
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_resume\n")
+  }
+
+  eprint "Resuming of trajectory scans is currently not available."
+}'
+
+
+#==============================================================================
+# Internal macro definitions
+#==============================================================================
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_print_setup '{
+  """
+  Print the trajectoryscan configuration options and current values to screen.
+
+  NOTE:
+     The option numbers must be kept in sync between
+     :spec:def:`_trajectoryscan_set_option` and
+     :spec:def:`_trajectoryscan_print_setup`.
+
+  """
+
+  tty_cntl("so")  # highlight font
+  printf("Trajectory scanning setup:\n")
+  tty_cntl("se")  # turn off font highlighting
+
+  printf("\n 1)  %-55s: %s", "Trajectory IOC PV prefix", \
+      TRAJECTORYSCAN_PV_PREFIX)
+  printf("\n 2)  %-55s: %s", "XPS group name", \
+      TRAJECTORYSCAN_XPS_GROUP_NAME)
+  printf("\n 3)  %-55s: %s", "MCS PV prefix", \
+      TRAJECTORYSCAN_MCS_PV_PREFIX)
+  printf("\n 4)  %-55s: ", "Use actual motor positions (calculated otherwise)")
+  if(TRAJECTORYSCAN_USE_ACTUAL){
+    printf("YES")
+  } else{
+    printf("NO")
+  }
+  printf("\n 5)  %-55s: ", "Reported positions for each trajectory element")
+  if(TRAJECTORYSCAN_POS_MODE == 0){
+    printf("average position")
+  } else if(TRAJECTORYSCAN_POS_MODE == 1){
+    printf("start point")
+  } else{
+    printf("end point")
+  }
+  printf("\n 6)  %-55s: %.2f sec", \
+      "Update interval for trajectoryscan plots (min 1 sec)", \
+      TRAJECTORYSCAN_READ_INTERVAL)
+
+  printf("\n 7)  %-55s: %.2f sec", "Maximum EPICS callback timeout", \
+      TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+  printf("\n 8)  %-55s: %d", "Trajectoryscan debug output level", \
+      TRAJECTORYSCAN_DEBUG)
+
+  printf("\n\n")
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_set_option '{
+  """
+  Sets a new value for a given option.
+
+  DESCRIPTION:
+    Sets a new value for a given option from the options menu that was created
+    with the :spec:def:`_trajectoryscan_print_setup` command.
+
+  NOTE:
+    The option numbers must be kept in sync between
+    :spec:def:`_trajectoryscan_set_option` and
+    :spec:def:`_trajectoryscan_print_setup`.
+
+  """
+
+  local _input, _dummy, _valid, _numitems, _valid
+
+  #----------
+  if ($1==1){
+    _valid = 0
+    while(!(_valid)){
+      _input = getsval("Enter the trajectory IOC PV prefix", TRAJECTORYSCAN_PV_PREFIX)
+      _pv = sprintf("%sBuild", _input)
+      if(epics_par(_pv, "type") == ""){
+        local _str
+        _str = sprintf("The requested PV prefix %s does not seem to exist\n.",\
+               _input)
+        _str = sprintf("%sPlease enter a valid PV prefix", _str)
+        eprint _str
+      } else {
+        TRAJECTORYSCAN_PV_PREFIX = _input
+        _valid = 1
+      }
+    }
+
+  #----------
+  } else if ($1==2){
+    _input = getsval("Enter the XPS group name", TRAJECTORYSCAN_XPS_GROUP_NAME)
+    TRAJECTORYSCAN_XPS_GROUP_NAME = _input
+
+  #----------
+  } else if ($1==3){
+    _valid = 0
+    while(!(_valid)){
+      _input = getsval("Enter the MCS PV prefix", TRAJECTORYSCAN_MCS_PV_PREFIX)
+      _pv = sprintf("%sStartAll", _input)
+      if(epics_par(_pv, "type") == ""){
+        local _str
+        _str = sprintf("The requested PV prefix %s does not seem to exist\n.",\
+               _input)
+        _str = sprintf("%sPlease enter a valid PV prefix", _str)
+        eprint _str
+      } else {
+        TRAJECTORYSCAN_MCS_PV_PREFIX = _input
+        _valid = 1
+      }
+    }
+
+  #----------
+  } else if ($1==4){
+    printf("The scan can record either the actual motor positions\n")
+    printf("or the nominal positions for each scan point.\n")
+    TRAJECTORYSCAN_USE_ACTUAL = yesno("Use actual positions", \
+        TRAJECTORYSCAN_USE_ACTUAL)
+
+  #----------
+  } else if ($1==5){
+    printf("The reported (saved) motor position for each trajectory element\n")
+    printf("can be either the average position within the element (linear),\n")
+    printf("or the start position or the end position.\n")
+
+    _valid = 0
+    while(!(_valid)){
+      printf("Please choose which positions to report:\n")
+      printf("  0 - Average position (linear average between end points)\n")
+      printf("  1 - Start position\n")
+      printf("  2 - End position\n")
+      _input = getsval("Enter number", TRAJECTORYSCAN_POS_MODE)
+      if(_input == 0 || _input == 1 || _input == 2){
+        TRAJECTORYSCAN_POS_MODE = _input
+        _valid = 1
+      } else {
+        printf("ERROR: Invalid choice: %s\n", _input)
+        _valid = 0
+      }
+    }
+
+  #----------------
+  } else if ($1==6){
+
+    printf("Specify the update interval for the scan plot during the scans.\n")
+    TRAJECTORYSCAN_READ_INTERVAL = getval("Update interval [sec]", \
+        TRAJECTORYSCAN_READ_INTERVAL)
+
+  #----------------
+  } else if ($1==7){
+
+    printf("Specify the maximum timeout for EPICS callbacks.\n")
+    printf(" (Usually callbacks will be much faster than this)\n")
+    TRAJECTORYSCAN_EPICS_TIMEOUT = getval("Timeout [sec]", \
+        TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+  #----------------
+  } else if ($1==8){
+
+    printf("Set the bit flags for the level of debug output:\n")
+    printf("  0 - no debug information is shown\n")
+    printf("  1 - general debug information\n")
+    printf("  2 - detailed debug info related to data retrieval\n")
+    TRAJECTORYSCAN_DEBUG = getval("Trajectoryscan debug flag", \
+        TRAJECTORYSCAN_DEBUG)
+
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_pre_check '{
+  """
+  Run some test to check if trajectory scan parameters are valid
+
+  DESCRIPTION:
+    The :spec:def:`_trajectoryscan_init' macro redefines the
+    :spec:def:`_trajectoryscan_count_func` for trajectory scans and calls the
+    MCS and user-defined initialization macros
+    :spec:def:`_trajectoryscan_mcs_init` and\
+    :spec:def:`_trajectoryscan_user_init`.
+
+  USAGE::
+
+    > _trajectoryscan_pre_check
+
+  """
+
+  # Check the maximum allowable number of trajectory elements.
+  if(_n1 > TRAJECTORYSCAN_MAX_ELEMENTS){
+    eprintf("ERROR: Too many trajectory elements.\n")
+    eprintf("  Trajectory scanning supports only scans up to %d elements.\n", \
+        TRAJECTORYSCAN_MAX_ELEMENTS)
+    eprint("  You can use step scanning instead. (use \'trajectoryscan_off\')\n")
+    exit
+  }
+
+  # Make sure the MCS can handle the number of scan points
+  if(_n1 > _TRAJECTORYSCAN_MCS_MAX_CHANNELS)  {
+    eprintf("ERROR: Too many scan points for MCS.\n")
+    eprintf("  The MCS supports only scans up to %d points.\n", \
+        _TRAJECTORYSCAN_MCS_MAX_CHANNELS)
+    eprint("  You can use step scanning instead. (use \'trajectoryscan_off\')\n")
+    exit
+  }
+
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_init '{
+  """
+  Prepare for a trajectory scan.
+
+  DESCRIPTION:
+    The :spec:def:`_trajectoryscan_init' macro redefines the
+    :spec:def:`_trajectoryscan_count_func` for trajectory scans and calls the
+    MCS and user-defined initialization macros
+    :spec:def:`_trajectoryscan_mcs_init` and\
+    :spec:def:`_trajectoryscan_user_init`.
+
+  USAGE::
+
+    > _trajectoryscan_init
+
+  """
+
+  local _pv, _num_mot, _ii
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_init\n")
+  }
+
+  # make sure the SCAN_D array is large enough
+  while(_n1 > array_op("rows",SCAN_D)) resize_scan_data()
+
+  # Suppress the normal count command (which will be called as part of the
+  # _loop macro when the data is collected from the MCAs, etc.) and defined it
+  # to do nothing.
+  # Note that in _loop, scan_count is passed one argument (_ctime). Our
+  # replacement definition of _count needs to process that argument in some
+  # way, otherwise we get an error. This is simply done by assigning it to
+  # a local variable _dummy.
+  # For some reason this does not work without the printf("") command, I get a
+  # segmentation fault in that case. Need to look into this to remove this
+  # annoying "feature".
+  rdef _trajectoryscan_count_func(_arg) \' printf(""); local _dummy; _dummy = _arg; \'
+
+  # Initialize the Trajectory support in EPICS
+  _pv = TRAJECTORYSCAN_PV_PREFIX "GroupName"
+  epics_put(_pv, TRAJECTORYSCAN_XPS_GROUP_NAME, TRAJECTORYSCAN_EPICS_TIMEOUT)
+  _pv = TRAJECTORYSCAN_PV_PREFIX "TrajectoryFile"
+  epics_put(_pv, TRAJECTORYSCAN_FILE_NAME, TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+  # Re-initialize some arrays
+  # This makes sure that the arrays have the correct dimensions and contain
+  # enough elements to hold all scan points.
+  _num_mot = 0
+  for(_mne in TRAJECTORYSCAN_MOTOR_NUM){
+    _num_mot++
+  }
+
+  unglobal _TRAJECTORYSCAN_TIME
+  unglobal _TRAJECTORYSCAN_POS_SEND
+  unglobal _TRAJECTORYSCAN_POS
+  unglobal _TRAJECTORYSCAN_FINAL_POS
+
+  global array _TRAJECTORYSCAN_TIME[_n1+1]
+  global array _TRAJECTORYSCAN_POS_SEND[_num_mot][_n1+1]
+  global array _TRAJECTORYSCAN_POS[_num_mot][_n1+1]
+  global array _TRAJECTORYSCAN_FINAL_POS[_num_mot][_n1]
+
+  # Set the move flag to zero for all motors and assign the data column number
+  _ii = 0
+  for(_mne in TRAJECTORYSCAN_MOTOR_NUM){
+    _TRAJECTORYSCAN_MOVE[_mne] = 0
+    _TRAJECTORYSCAN_MOTOR_COL[_mne] = _ii
+    _ii++
+  }
+
+  if(TRAJECTORYSCAN_DEBUG & 2){
+    printf("  Assigned motor columns in positions array:\n")
+    print _TRAJECTORYSCAN_MOTOR_COL
+  }
+
+  # Initialize the MCS
+  _trajectoryscan_mcs_init
+
+  # run user-defined initialization macros
+  _trajectoryscan_user_init
+
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_mcs_init '{
+  """
+  Initialize and prepare the MCS for trajectoryscanning.
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_mcs_init\n")
+  }
+
+  local _pv
+
+  # Stop MCS in case it was Acquiring
+  _trajectoryscan_mcs_stop
+  
+  # Preset time
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "PresetReal"
+  epics_put(_pv, 0.0, TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+  # External channel advance
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "ChannelAdvance"
+  epics_put(_pv, "External", TRAJECTORYSCAN_EPICS_TIMEOUT)
+  
+"""
+JES comment out this block 8-5-2024
+  # Arm the MCS on start (otherwise, the first external trigger pulse just arms
+  # it, but does not channel advance)
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "CountOnStart"
+  # 2018-10-3 (PJE) See note in in CHANGE LOG
+  #epics_put(_pv, "No", TRAJECTORYSCAN_EPICS_TIMEOUT)
+  epics_put(_pv, "Yes", TRAJECTORYSCAN_EPICS_TIMEOUT)
+"""
+
+  # Set external preset to 1
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "Prescale"
+  epics_put(_pv, 1, TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+  # Disable client wait
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "EnableClientWait"
+  epics_put(_pv, "Disable", TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+  # Obtain the maximum number of available channels
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "MaxChannels"
+  _TRAJECTORYSCAN_MCS_MAX_CHANNELS = epics_get(_pv)
+
+  # Set the number of channels to use to max
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "NuseAll"
+  epics_put(_pv, _TRAJECTORYSCAN_MCS_MAX_CHANNELS, TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+""""
+JES comment out 8-5-2024
+  # Set the output polarity to inverted to trigger other detectors
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "OutputPolarity"
+  epics_put(_pv, 1, TRAJECTORYSCAN_EPICS_TIMEOUT)
+"""
+
+  # Initialize the MCS data array
+  unglobal _TRAJECTORYSCAN_MCS_DATA
+  global array _TRAJECTORYSCAN_MCS_DATA[_TRAJECTORYSCAN_MCS_MAX_CHANNELS][TRAJECTORYSCAN_MCS_MAX_INPUTS]
+
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_arm '{
+  """
+  Arm the scalers and detectors immediately before the trajectory scan starts.
+
+  DESCRIPTION:
+    The :spec:def:`_trajectoryscan_arm` calls the MCS and user-defined arm
+    macros :spec:def:`_trajectoryscan_mcs_arm` and
+    :spec:def:`_trajectoryscan_user_arm`.
+
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_arm\n")
+  }
+
+  # Arm the MCS
+  _trajectoryscan_mcs_arm
+
+  # Run user-defined arm macros
+  _trajectoryscan_user_arm
+
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_mcs_arm '{
+  """
+  Arm the MCS and start the next acquisition.
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_mcs_arm\n")
+  }
+
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "EraseStart"
+  epics_put(_pv, 1)
+  sleep(0.02)
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("  Hit the MCS EraseStart button.\n")
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_build '{
+  """
+  Build the trajectory for the trajectory scan.
+
+  USAGE::
+
+    > _trajectoryscan_build <nels> <npts>
+
+  ARGUMENTS:
+    :nels: number of trajectory elements
+    :npts: number of output pulses
+
+  """
+
+  local i, _pv, mess, nels, npts
+
+  if ($# != 2) {
+    eprint "ERROR: Wrong number of arguments in _trajectoryscan_build !"
+    eprint "  Usage: _trajectoryscan_build nels npts"
+    exit
+  } else {
+    nels = $1
+	npts = $2
+  }
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_build\n")
+    printf("  Building trajectory with nels = %d, npts = %d\n", nels, npts)
+  }
+
+  if(TRAJECTORYSCAN_DEBUG & 2){
+    printf("  Calculated motor positions:\n")
+    print _TRAJECTORYSCAN_POS
+    printf("  Motor positions sent to controller:\n")
+    print _TRAJECTORYSCAN_POS_SEND
+  }
+
+  # Setup EPICS Trajectory Scan
+  _pv = TRAJECTORYSCAN_PV_PREFIX "TimeMode"
+  epics_put(_pv, "Array", TRAJECTORYSCAN_EPICS_TIMEOUT)
+  _pv = TRAJECTORYSCAN_PV_PREFIX "NumPoints"
+  epics_put(_pv, nels, TRAJECTORYSCAN_EPICS_TIMEOUT)
+  _pv = TRAJECTORYSCAN_PV_PREFIX "NumPulses"
+  epics_put(_pv, npts, TRAJECTORYSCAN_EPICS_TIMEOUT)
+  _pv = TRAJECTORYSCAN_PV_PREFIX "StartPulses"
+  epics_put(_pv, 1, TRAJECTORYSCAN_EPICS_TIMEOUT)
+  _pv = TRAJECTORYSCAN_PV_PREFIX "EndPulses"
+  epics_put(_pv, nels, TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+  for(_mne in TRAJECTORYSCAN_MOTOR_NUM) {
+    i = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+    if((TRAJECTORYSCAN_MOTOR_NUM[_mne]) > 0){
+      _pv = TRAJECTORYSCAN_PV_PREFIX "M" TRAJECTORYSCAN_MOTOR_NUM[_mne] "UseAxis"
+      epics_put(_pv, _TRAJECTORYSCAN_MOVE[_mne], TRAJECTORYSCAN_EPICS_TIMEOUT)
+      _pv = TRAJECTORYSCAN_PV_PREFIX "M" TRAJECTORYSCAN_MOTOR_NUM[_mne] "Positions"
+      epics_put(_pv, _TRAJECTORYSCAN_POS_SEND[i][0:nels-1], \
+          TRAJECTORYSCAN_EPICS_TIMEOUT)
+    }
+  }
+  _pv = TRAJECTORYSCAN_PV_PREFIX "Times"
+  epics_put(_pv, _TRAJECTORYSCAN_TIME[0:nels-1], TRAJECTORYSCAN_EPICS_TIMEOUT)
+  _pv = TRAJECTORYSCAN_PV_PREFIX "Build"
+  epics_put(_pv, 1, TRAJECTORYSCAN_EPICS_TIMEOUT)
+  while (epics_get(_pv) == "Build") sleep(0.1)
+  _pv = TRAJECTORYSCAN_PV_PREFIX "BuildStatus";
+  #PJE added fix for "Undefined" status message problem 10/3/17
+  while (epics_get(_pv) == "Undefined") sleep(0.1)
+  if (epics_get(_pv) != "Success") {
+    _pv = TRAJECTORYSCAN_PV_PREFIX "BuildMessage"
+    mess = epics_get(_pv, "string")
+    eprintf("Profile build failed, error message = %s", mess)
+    exit
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_run '{
+  """
+  Execute the trajectory scan.
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_run\n")
+  }
+
+  local _pv, _mess
+  local _timer, _ii
+
+  # Execute user-defined code immediately before starting the scan
+  _trajectoryscan_user_pre_run
+
+  # Grab the current motor positions before the scan starts (this includes all
+  # motors that are not part of the trajectory setup).
+  waitmove
+  get_angles
+
+  # Hit the start button for the trajectory scan
+  # NOTE: We do not wait for the callback here, since this is only sent at the
+  #       end of the trajectory scan?
+  _pv = TRAJECTORYSCAN_PV_PREFIX "Execute"
+  epics_put(_pv, 1)
+
+  # While the scan is running, fetch data in regular intervals and update the
+  # plot.
+  sleep(0.1)
+  _timer = 0.0
+  while(_trajectoryscan_is_running()){
+    if(_timer > TRAJECTORYSCAN_READ_INTERVAL){
+      _trajectoryscan_get_data
+      _trajectoryscan_plot
+      _timer = 0.0
+    }
+    sleep(0.1)
+    _timer += 0.1
+  }
+
+  # Check the trajectory scan exit status
+  _pv = TRAJECTORYSCAN_PV_PREFIX "ExecuteStatus";
+  #PJE added fix for "Undefined" status message problem 10/3/17
+  while (epics_get(_pv) == "Undefined") sleep(0.1)
+  if (epics_get(_pv) != "Success") {
+    _pv = TRAJECTORYSCAN_PV_PREFIX "ExecuteMessage"
+    _mess = epics_get(_pv, "string")
+    eprintf("Profile scan execution failed, error message = %s", _mess)
+    _trajectoryscan_scanabort
+    exit
+  }
+
+  # Stop the MCS acquisition
+  _trajectoryscan_mcs_stop
+
+  # Wait for everything to finish
+  waitmove
+  _trajectoryscan_mcs_wait
+  _trajectoryscan_user_wait
+
+  # Process the data
+  _trajectoryscan_get_data
+  _trajectoryscan_plot
+
+  # Execute user-defined code immediately after scan has finished
+  _trajectoryscan_user_post_run
+
+  if(TRAJECTORYSCAN_DEBUG){
+   printf("  Finished: _trajectoryscan_run\n")
+  }
+
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_is_running() '{
+  """
+  Check if the trajectoryscan is still running.
+
+  RETURNS:
+    1 - If the scan is still running.
+    0 - If the scan has finished.
+
+  """
+
+  local _pv
+
+  _pv = TRAJECTORYSCAN_PV_PREFIX "Execute"
+
+  if(epics_get(_pv) == "Execute"){
+    return 1
+  } else {
+    return 0
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_mcs_stop '{
+  """
+  Stop the MCS acquisition.
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_mcs_stop\n")
+  }
+
+  local _pv
+
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "StopAll"
+  epics_put(_pv, 1, TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_mcs_wait '{
+  """
+  Wait for the MCS to finish acquiring.
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_mcs_wait\n")
+  }
+
+  local _timer, _pv
+
+  sleep(0.1) # does this help to avoid PV not connected errors?
+  _timer = 0.0
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "Acquiring"
+  while(epics_get(_pv, "string") != "Done"){
+    sleep(0.1)
+    _timer += 0.1
+    if(_timer > 5.0){
+      printf("Waiting for MCS to finish acquisition, did not return ready.\n")
+      _timer = 0.0
+    }
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_get_data '{
+  """
+  Obtain the data collected during a trajectoryscan.
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_get_data\n")
+  }
+
+  if(_trajectoryscan_get_current_point() > 0){
+    _trajectoryscan_mcs_get_data
+    _trajectoryscan_user_get_data
+    _trajectoryscan_mcs_read_counts
+    _trajectoryscan_user_read_counts
+    _trajectoryscan_read_positions
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_get_current_point() '{
+  """
+  Obtain the current number of recorded scan points from the MCS.
+
+  RETURNS
+    :current_point: The current scan point.
+
+  """
+
+  local _pv
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_get_current_point\n")
+  }
+
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "CurrentChannel"
+  _TRAJECTORYSCAN_MCS_CURRENT_POINT = epics_get(_pv)
+
+  if(TRAJECTORYSCAN_DEBUG & 2){
+    printf("  Current point from MCS = %d\n", \
+        _TRAJECTORYSCAN_MCS_CURRENT_POINT)
+  }
+
+  # The XPS controller puts out pulses in the decelleration element as well
+  # (otherwise we would be missing the very last pulse), so we have to make
+  # sure we do not read more than the total number of scan points elements from
+  # the arrays.
+  if(_TRAJECTORYSCAN_MCS_CURRENT_POINT > _n1){
+    _TRAJECTORYSCAN_MCS_CURRENT_POINT = _n1
+    if(TRAJECTORYSCAN_DEBUG & 2){
+      printf("  Current point corrected to: %d\n", \
+          _TRAJECTORYSCAN_MCS_CURRENT_POINT)
+    }
+  }
+
+  return _TRAJECTORYSCAN_MCS_CURRENT_POINT
+
+}'
+
+
+#------------------------------------------------------------------------------
+def  _trajectoryscan_mcs_get_data '{
+  """
+  Obtain the data from the MCS up to the current scan point.
+
+  NOTE:
+    All the data for all the channels is read and stored in the global variable
+    array :spec:global:`_TRAJECTORYSCAN_MCS_DATA`.
+
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_mcs_get_data\n")
+  }
+
+  local _ii, _pv, _cp
+  local array _tmp_array[_TRAJECTORYSCAN_MCS_MAX_CHANNELS]
+
+  _cp = _TRAJECTORYSCAN_MCS_CURRENT_POINT
+
+  # Zero out the data in the array
+  array_op("fill", _TRAJECTORYSCAN_MCS_DATA, 0, 0)
+
+  # Force a read of the data at this moment
+  _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "ReadAll.PROC"
+  epics_put(_pv, 1, TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+  # Get all the scaler data
+  for (_counter in TRAJECTORYSCAN_MCS_SCALER_INPUT) {
+    _mcs_col = TRAJECTORYSCAN_MCS_SCALER_INPUT[_counter]
+    _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "mca" _mcs_col ".VAL"
+        # 2018-10-3 (PJE) Mapped the MCS channel 1 data
+    # to specs data element 0.  Need to make sure 
+    # MCS has "count on start set to "YES"  See Change Log above.      
+    
+    #_TRAJECTORYSCAN_MCS_DATA[0:_cp][_mcs_col - 1] = \
+    #    array_op("transpose", _tmp_array[0:_cp])
+    _tmp_array = epics_get(_pv, _cp + 1)
+    _TRAJECTORYSCAN_MCS_DATA[0:_cp-1][_mcs_col - 1] = \
+        array_op("transpose", _tmp_array[1:_cp])    
+        
+    if(TRAJECTORYSCAN_DEBUG & 2){
+      printf("  Scaler: %s\n", _counter)
+      printf("    MCS Array PV: %s\n", _pv)
+      printf("    MCS Data column: %s\n", _mcs_col - 1)
+      printf("    MCS data: ")
+      print epics_get(_pv, _cp)
+    }
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_mcs_read_counts '{
+  """
+  Read the SPEC counter data from the MCS data array.
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_mcs_read_counts\n")
+  }
+
+  local _cp
+
+  _cp = _TRAJECTORYSCAN_MCS_CURRENT_POINT
+   SCAN_D[0:cp1-1]["io"] = _TRAJECTORYSCAN_MCS_DATA[0:_cp-1][1]
+   SCAN_D[0:cp1-1]["i1"] = _TRAJECTORYSCAN_MCS_DATA[0:_cp-1][2]
+
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_read_positions '{
+  """
+  Read back the motor positions for each scan point.count
+
+  """
+
+  local _cp
+  _cp = _TRAJECTORYSCAN_MCS_CURRENT_POINT
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_read_positions\n")
+    printf("  Current scan point: %d\n", _cp)
+  }
+
+  if(TRAJECTORYSCAN_USE_ACTUAL & !(_trajectoryscan_is_running())){
+    if(TRAJECTORYSCAN_DEBUG & 2){
+      printf("  Using actual motor positions from trajectory scan.\n")
+    }
+    _trajectoryscan_read_actual
+  } else {
+    if(TRAJECTORYSCAN_DEBUG & 2){
+      printf("  Using calculated motor positions from scan parameters.\n")
+    }
+  }
+
+  # Retrieve the positions of the physical motors during the scan
+  for(_mne in _TRAJECTORYSCAN_MOTOR_COL){
+    _i = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+    if(TRAJECTORYSCAN_MOTOR_NUM[_mne] > 0){
+      if(TRAJECTORYSCAN_POS_MODE == 0){
+        # Average position in trajectory element
+        _TRAJECTORYSCAN_FINAL_POS[_i][0:_cp - 1] = \
+            (_TRAJECTORYSCAN_POS[_i][0:_cp - 1] + \
+            _TRAJECTORYSCAN_POS[_i][1:_cp])/2
+      } else if (TRAJECTORYSCAN_POS_MODE == 1){
+        # Start position of trajectory element
+        _TRAJECTORYSCAN_FINAL_POS[_i][0:_cp - 1] = \
+            _TRAJECTORYSCAN_POS[_i][0:_cp - 1]
+      } else {
+        # End position of trajectory element
+        _TRAJECTORYSCAN_FINAL_POS[_i][0:_cp - 1] = \
+            _TRAJECTORYSCAN_POS[_i][1:_cp]
+      }
+    }
+  }
+
+  if(TRAJECTORYSCAN_DEBUG & 2){
+    printf("  Final motor positions (before calculating pseudo-motors):\n")
+    print _TRAJECTORYSCAN_FINAL_POS
+  }
+
+  # Calculate the corresponding pseudo-motor positions
+  if(_trajectoryscan_has_pseudo_motor()){
+    for(_ii = 0; _ii < _cp; _ii++){
+      for(_mne in _TRAJECTORYSCAN_MOTOR_COL){
+        _i = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+        if(TRAJECTORYSCAN_MOTOR_NUM[_mne] > 0){
+          A[motor_num(_mne)] = _TRAJECTORYSCAN_FINAL_POS[_i][_ii]
+        }
+      }
+      calcP_fromR
+      for(_mne in _TRAJECTORYSCAN_MOTOR_COL){
+        _i = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+        if(TRAJECTORYSCAN_MOTOR_NUM[_mne] < 0){
+          _TRAJECTORYSCAN_FINAL_POS[_i][_ii] = A[motor_num(_mne)]
+        }
+      }
+    }
+  }
+
+  if(TRAJECTORYSCAN_DEBUG & 2){
+    printf("  Final motor positions (after calculating pseudo-motors):\n")
+    print _TRAJECTORYSCAN_FINAL_POS
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_read_actual '{
+  """
+  Reads the actual motor positions from the trajectory scan and puts the
+  results in the global array :spec:global:`_TRAJECTORYSCAN_POS`.
+
+  """
+
+  local _i, _j, _pv, _npts, mess, _cp
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_read_actual\n")
+  }
+
+  _cp = _TRAJECTORYSCAN_MCS_CURRENT_POINT
+  _pv = TRAJECTORYSCAN_PV_PREFIX "Readback"
+  epics_put(_pv, 1, TRAJECTORYSCAN_EPICS_TIMEOUT)
+
+  _pv = TRAJECTORYSCAN_PV_PREFIX "ReadbackState"
+  while(epics_get(_pv) != "Done") sleep(0.1)
+
+  _pv = TRAJECTORYSCAN_PV_PREFIX "ReadbackStatus"
+  #PJE added fix for "Undefined" status message problem 10/3/17
+  while (epics_get(_pv) == "Undefined") sleep(0.1)
+  if(epics_get(_pv) != "Success") {
+    _pv = TRAJECTORYSCAN_PV_PREFIX "ReadbackMessage"
+    mess = epics_get(_pv,"string")
+    eprintf("Profile scan read failed, error message = %s", mess)
+    exit
+  }
+
+  _pv = TRAJECTORYSCAN_PV_PREFIX "NumActualPulses"
+  _npts = epics_get(_pv)
+
+  if((_npts - 1) < _cp){
+   printf("WARNING: Actual number of motor positions too small!\n")
+  }
+
+  for(_mne in TRAJECTORYSCAN_MOTOR_NUM){
+    _i = TRAJECTORYSCAN_MOTOR_NUM[_mne]
+    _j = _TRAJECTORYSCAN_MOTOR_COL[_mne]
+    if(_i > 0){
+      _pv = TRAJECTORYSCAN_PV_PREFIX "M" _i "Readbacks"
+      _TRAJECTORYSCAN_POS[_j][0:_cp] = epics_get(_pv, _npts)
+    }
+  }
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("  Number of actual trajectory pulses: %d\n", _npts)
+    printf("  Current point (according to MCS):   %d\n", \
+        _TRAJECTORYSCAN_MCS_CURRENT_POINT)
+  }
+
+  if(TRAJECTORYSCAN_DEBUG & 2){
+    printf("  Actual motor positions:\n")
+    print _TRAJECTORYSCAN_POS
+  }
+}'
+
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_plot '{
+  """
+  Plot the trajectoryscan data.
+
+  NOTE:
+    The first column of the :spec:global:`SCAN_D` contains the x-axis values
+    for the scan plot.
+
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_plot\n")
+  }
+
+  local _cp, _ind, _ii, _jj
+  _cp = _TRAJECTORYSCAN_MCS_CURRENT_POINT
+
+  if(_cp > 1){
+
+    # set the total number of scan points to plot
+    LDT =  _cp-1
+
+    if(_stype & 1){
+      # this is a motor scan, use the first motor for the x-axis
+
+      _ind = _TRAJECTORYSCAN_MOTOR_COL[motor_mne(_m[0])]
+      SCAN_D[0:LDT][0] = array_op("transpose", \
+          _TRAJECTORYSCAN_FINAL_POS[_ind][0:LDT])
+
+    } else if(_stype & 2){
+      # this is an HKL-scan
+      # we need to calculate the HKL values for the motor positions
+
+      # find the x-axis label for the scan
+      if(X_L == "H"){
+        _coord = 0
+      } else if (X_L == "K"){
+        _coord = 1
+      } else {
+        _coord = 2
+      }
+
+      # retrieve angles and calculate HKL values for each scan point
+      for(_ii = 0; _ii <= LDT; _ii++){
+        for(_jj = 0; _jj < _numgeo; _jj++){
+          _ind = _TRAJECTORYSCAN_MOTOR_COL[motor_mne(mA[_jj])]
+          A[mA[_jj]] = _TRAJECTORYSCAN_FINAL_POS[_ind][_ii]
+        }
+        calcHKL
+        SCAN_D[_ii][0] = Q[_coord]
+      }
+    }
+
+    # call the plot command
+    splot
+
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_finish '{
+  """
+  Cleanup procedures after a trajectoryscan has finished.
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_finish\n")
+  }
+
+  # Restore the count command to actually perform the count step.
+  rdef _trajectoryscan_count_func(_arg) \'
+    if(_arg){
+      _ord_count _arg
+    } else {
+      _ord_count
+    }
+  \'
+
+  # Execute user-defined cleanup code
+  _trajectoryscan_user_finish
+
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_abort '{
+  """
+  Cleanup routine for aborted trajectory scans.
+
+  Hooks into :spec:cdef:`cleanup_once`.
+
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_abort\n")
+  }
+
+  # run user-defined cleanup code
+  _trajectoryscan_user_pre_abort
+
+  # hit the traj scan abort button
+  _pv = TRAJECTORYSCAN_PV_PREFIX "Abort"
+  epics_put(_pv, 1)
+
+  # Stop the MCS acquisition
+  _trajectoryscan_mcs_stop
+
+  # Wait for everything to finish
+  waitmove
+  _trajectoryscan_mcs_wait
+  _trajectoryscan_user_wait
+
+  # read all the data we have so far
+  _trajectoryscan_get_data
+
+  # save all the date we have so far
+  _trajectoryscan_savedata_func(_TRAJECTORYSCAN_MCS_CURRENT_POINT)
+
+  # plot the data we have so far
+  _trajectoryscan_plot
+
+  # clean up after a scan
+  _trajectoryscan_finish
+
+  # run user-defined cleanup code
+  _trajectoryscan_user_post_abort
+
+  comment "Trajectory scan aborted"
+
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_check_motor(mot) '{
+  """
+  Check whether motor is a valid trajectory scan motor.
+
+  USAGE::
+
+    > flag = _trajectoryscan_check_motor(<mot>)
+
+  ARGUMENTS:
+    :mot: Any SPEC motor name, number, or mnemonic
+
+  RETURNS:
+    :flag: 1 if motor is a valid trajectoryscan motor, 0 otherwise
+
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_check_motor\n")
+  }
+
+  if(motor_mne(motor_num(mot)) in TRAJECTORYSCAN_MOTOR_NUM){
+    return 1
+  } else {
+    return 0
+  }
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_is_real_motor(mot) '{
+  """
+  Check whether motor is a real (non-pseudo) trajectory scan motor.
+
+  USAGE::
+
+    > flag = _trajectoryscan_is_real_motor(<mot>)
+
+  ARGUMENTS:
+    :mot: Any SPEC motor name, number, or mnemonic
+
+  RETURNS:
+    :flag: 1 if motor is a real (non-pseudo) trajectoryscan motor, 0 otherwise
+
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_is_real_motor\n")
+  }
+
+  if(TRAJECTORYSCAN_MOTOR_NUM[motor_mne(motor_num(mot))] > 0){
+    if(TRAJECTORYSCAN_DEBUG & 2){
+      printf("  Motor: %s is a real motor\n", motor_mne(motor_num(mot)))
+    }
+    return 1
+  }
+  if(TRAJECTORYSCAN_DEBUG & 2){
+    printf("  Motor: %s is not a real motor\n", motor_mne(motor_num(mot)))
+  }
+  return 0
+}'
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_has_pseudo_motor() '{
+  """
+  Check whether there are pseudo-motors defined for the trajectory scan.
+
+  USAGE::
+
+    > flag = _trajectoryscan_has_pseudo_motor()
+
+  RETURNS:
+    :flag: 1 if pseudo-motors are present, 0 otherwise
+
+  NOTE:
+    Pseudo-motors are identified by a value of "-1" in
+    :spec:global:`TRAJECTORYSCAN_MOTOR_NUM`.
+
+  """
+
+  if(TRAJECTORYSCAN_DEBUG){
+    printf("***\n")
+    printf("Executing: _trajectoryscan_has_pseudo_motor\n")
+  }
+
+  for(_mne in TRAJECTORYSCAN_MOTOR_NUM){
+    if(TRAJECTORYSCAN_MOTOR_NUM[_mne] < 0){
+      return 1
+    }
+  }
+  return 0
+}'
+
+
+
+
+#------------------------------------------------------------------------------
+def _trajectoryscan_resume '{
+  """
+  Resume usually restarts aborted scans. For trajectory scans, resume is
+  currently not supported.
+
+  NOTE:
+    How exactly would one resume an aborted trajectory scan? Start a new scan
+    from where the old one stopped?
+
+  """
+
+  eprint "Resuming of trajectoryscans is currently not supported."
+
+}'
+
+
+#------------------------------------------------------------------------------
+# define this only if there is no _clear_screen function available yet
+if (!(whatis("_clear_screen") & 0x2)){
+  def _clear_screen '{
+    """
+    Clear the terminal screen
+
+    DESCRIPTION:
+      Clears the screen without losing the screen history or messing up the
+      scrolling capabilities (this has been a problem for certain terminals)
+      by blanking out the entire height of the screen with newlines and
+      returning the cursor to the top left corner.
+
+    USAGE::
+
+      > _clear_screen
+
+    NOTE:
+      This macro only gets defined here if it was not defined already.
+
+    """
+
+    # update the ROWS and COLS variables in case the terminal has been resized
+    tty_cntl("resized?")
+
+    # print as many newlines as there are ROWS in terminal
+    cl_text = ""
+    for (i=0;i<ROWS;i++){
+      cl_text = cl_text "\n"
+    }
+    printf(cl_text)
+
+    # move back to the top of the screen and clear to end of the screen
+    tty_move(0,0)
+    tty_cntl("cd")
+
+  }'
+}
+
+
+#==============================================================================
+# Initialize empty user hooks
+#==============================================================================
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_add`
+cdef("_trajectoryscan_user_add")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_remove`
+cdef("_trajectoryscan_user_remove")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_init`
+cdef("_trajectoryscan_user_init")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_arm`
+cdef("_trajectoryscan_user_arm")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_pre_run`
+cdef("_trajectoryscan_user_pre_run")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_post_run`
+cdef("_trajectoryscan_user_post_run")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_wait`
+cdef("_trajectoryscan_user_wait")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_get_data`
+cdef("_trajectoryscan_user_get_data")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_read_counts`
+cdef("_trajectoryscan_user_read_counts")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_savedata`
+cdef("_trajectoryscan_user_savedata")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_finish`
+cdef("_trajectoryscan_user_finish")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_pre_abort`
+cdef("_trajectoryscan_user_pre_abort")
+
+#------------------------------------------------------------------------------
+#: Initialize empty cdef definition of :spec:def:`_trajectoryscan_user_post_abort`
+cdef("_trajectoryscan_user_post_abort")
+
+#==============================================================================
+# End of $Id: trajectoryscan_xps.mac 1358 2017-01-06 21:36:29Z stubbs $
+#==============================================================================
