@@ -2631,7 +2631,7 @@ def _trajectoryscan_mcs_init '{
   _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "CountOnStart"
   
   # 2018-10-3 (PJE) See note in in CHANGE LOG
-  epics_put(_pv, "Yes", TRAJECTORYSCAN_EPICS_TIMEOUT)
+  #epics_put(_pv, "Yes", TRAJECTORYSCAN_EPICS_TIMEOUT)
   #epics_put(_pv, "No", TRAJECTORYSCAN_EPICS_TIMEOUT)
   
   # Set external preset to 1
@@ -2652,7 +2652,7 @@ def _trajectoryscan_mcs_init '{
 
   # Set the output polarity to inverted to trigger other detectors
   _pv = TRAJECTORYSCAN_MCS_PV_PREFIX "OutputPolarity"
-  epics_put(_pv, 1, TRAJECTORYSCAN_EPICS_TIMEOUT)
+  #epics_put(_pv, 1, TRAJECTORYSCAN_EPICS_TIMEOUT)
 
   # Initialize the MCS data array
   unglobal _TRAJECTORYSCAN_MCS_DATA
